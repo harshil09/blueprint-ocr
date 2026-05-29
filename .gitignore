@@ -1,0 +1,62 @@
+# Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Testing / coverage
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Runtime data (CLI, FastAPI, Streamlit)
+inputs/
+uploads/
+outputs/
+output/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+*.tmp
+
+# Accidental pip typo files (e.g. "=1.24.0")
+=*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OCR model caches (if stored in the project)
+.paddleocr/
+inference/
