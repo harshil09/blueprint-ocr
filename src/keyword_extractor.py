@@ -14,7 +14,11 @@ def extract_keywords(text: str, max_keywords: int | None = None, language: str =
     if not text:
         return []
 
-    limit = max_keywords or config.MAX_KEYWORDS
+    limit = max_keywords if max_keywords is not None else config.MAX_KEYWORDS
+    if limit is None:
+        # YAKE requires an integer `top`; use a very high ceiling to emulate
+        # uncapped extraction for practical document sizes.
+        limit = 10_000
     extractor = yake.KeywordExtractor(
         lan=language,
         n=config.KEYWORD_NGRAM_MAX,

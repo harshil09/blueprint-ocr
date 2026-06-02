@@ -16,6 +16,9 @@ import numpy as np
 from src import config
 from src.ocr.ocr_engine import TextBox
 from src.utils import bbox_iou, save_bgr
+from src.logger import get_logger
+
+log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------

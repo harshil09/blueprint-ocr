@@ -1,0 +1,62 @@
+Project : Kestrel
+Assembly  Line
+CONFIDENTIAL
+Ref: MK-454-22
+DO NOT COPY
+Date: 17/04/23
+Sheet 7B
+Fuselage Integration
+Stage  3
+Internal  Use Only
+Checkpoints :
+Wing  alignment
+-  Avionics  Bay
+Hydraulic  Lines
+Fuel  System
+Note :
+Torque specs
+updated
+See Pg.
+12
+Next  Review
+24/04/23
+米
+Verify  rivet
+wo  wood
+Section  C
+ASAP
+Issue :
+QTY
+Reminder:
+Tool List:
+PART NO.
+DESCRIPTION
+Hydraulic  leak
+FUSELAGE ASSY
+1
+FUS-8831-01
+Rivet Gun (RG-77)
+2
+Calibrate  tools
+found in Line 3B
+WNG-5542-02
+WING ASSEMBLY
+1
+before  starting
+Torque  Wrench (20- 200 Wm)
+during  +est on
+TANK-7721-03
+FUELTANK（INT)
+1
+morning shift.
+- Drill Set (1/8"- 1/2")
+LANDING GEAR SET
+16/04 /23.
+LG-2001-04
+AVIONICS PACKAGE
+1
+Hydraulic Tester (HT-55)
+Resolved.
+AVL-1100-05
+30/04/23
+Target completion  for  this batch :

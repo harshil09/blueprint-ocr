@@ -18,6 +18,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from src import config
+
 SUPPORTED_TYPES = ["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp"]
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -91,19 +93,22 @@ def _list_preview_images(output_dir: str) -> list[Path]:
 def _render_results(data: dict) -> None:
     st.subheader("Summary")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Keywords", len(data.get("keywords") or []))
+    keywords = data.get("keywords") or []
+    keyword_count = len(keywords)
+    c1.metric("Keywords (count)", keyword_count)
     c2.metric("Figures", data.get("figures_count", 0))
     c3.metric("Pages", len(data.get("pages") or []))
+    if config.MAX_KEYWORDS is not None and keyword_count == config.MAX_KEYWORDS:
+        c1.caption(f"Capped at MAX_KEYWORDS={config.MAX_KEYWORDS}")
 
     if data.get("output_dir"):
         st.caption(f"Output directory: `{data['output_dir']}`")
 
-    keywords = data.get("keywords") or []
     if keywords:
         st.subheader("Keywords")
-        st.write(", ".join(f"`{kw}`" for kw in keywords[:40]))
-        if len(keywords) > 40:
-            st.caption(f"+ {len(keywords) - 40} more")
+        st.write(", ".join(f"`{kw}`" for kw in keywords))
+        #if len(keywords) > 40:
+         #   st.caption(f"+ {len(keywords) - 40} more")
 
     pages = data.get("pages") or []
     if pages:

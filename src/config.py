@@ -38,7 +38,8 @@ OCR_ACCURACY_MEASURE_PIPELINE = True
 # ---------------------------------------------------------------------------
 # Keyword extraction (YAKE)
 # ---------------------------------------------------------------------------
-MAX_KEYWORDS = 50
+# Set to None to disable capping and return as many keywords as YAKE can rank.
+MAX_KEYWORDS: int | None = None
 KEYWORD_NGRAM_MAX = 3
 KEYWORD_DEDUP_THRESHOLD = 0.85
 
