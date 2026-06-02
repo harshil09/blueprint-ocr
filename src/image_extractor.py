@@ -17,8 +17,11 @@ from src.extract_figure import (
     estimate_text_coverage_in_bbox,
     masked_non_text_edges,
 )
+from src.logger import get_logger
 from src.ocr.ocr_engine import TextBox
 from src.utils import bbox_iou, save_bgr
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,10 @@ def extract_embedded_pdf_images(
                 fig_idx += 1
     finally:
         doc.close()
+    if figures:
+        log.info("Embedded PDF images: extracted %d figure(s)", len(figures))
+    else:
+        log.debug("Embedded PDF images: none found (or skipped full-page scans)")
     return figures
 
 
@@ -355,6 +362,7 @@ def extract_all_figures(
     morphology_by_page = morphology_by_page or {}
 
     for page_index, morph_path in morphology_by_page.items():
+        log.debug("Page %d: using morphology figure %s", page_index, morph_path)
         figures.append(
             ExtractedFigure(
                 source_path=source_path,
@@ -374,6 +382,10 @@ def extract_all_figures(
 
     for page, ocr in zip(pages, ocr_results):
         if page.page_index in morphology_by_page:
+            log.debug(
+                "Page %d: skipping photo/layout (morphology figure already extracted)",
+                page.page_index,
+            )
             continue
 
         photos = extract_manufacturing_photo(
@@ -384,18 +396,34 @@ def extract_all_figures(
             if bbox is not None:
                 cov = estimate_text_coverage_in_bbox(bbox, ocr.boxes)
                 if cov > config.PHOTO_MAX_TEXT_COVERAGE:
+                    log.debug(
+                        "Page %d: photo candidate rejected (text coverage %.2f)",
+                        page.page_index,
+                        cov,
+                    )
                     photos = []
+        if photos:
+            log.info("Page %d: manufacturing photo extracted", page.page_index)
         figures.extend(photos)
 
         if not photos:
-            figures.extend(
-                extract_layout_figures(
-                    page.source_path,
-                    page.page_index,
-                    page.image,
-                    ocr.boxes,
-                    img_dir,
-                )
+            layout_figs = extract_layout_figures(
+                page.source_path,
+                page.page_index,
+                page.image,
+                ocr.boxes,
+                img_dir,
             )
+            if layout_figs:
+                log.info(
+                    "Page %d: layout figure(s) extracted (%d)",
+                    page.page_index,
+                    len(layout_figs),
+                )
+            figures.extend(layout_figs)
 
+    by_method: dict[str, int] = {}
+    for fig in figures:
+        by_method[fig.method] = by_method.get(fig.method, 0) + 1
+    log.info("Figure extraction summary: %s (total=%d)", by_method, len(figures))
     return figures

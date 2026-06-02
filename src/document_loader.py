@@ -10,7 +10,10 @@ import numpy as np
 from PIL import Image
 
 from src import config
+from src.logger import get_logger
 from src.utils import pil_to_bgr
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -65,14 +68,29 @@ def load_document(path: Path | str, dpi: int | None = None) -> list[PageImage]:
 
     dpi = dpi or config.OUTPUT_DPI
     ext = path.suffix.lower()
+    log.info("Loading document: %s (format=%s dpi=%d)", path.name, ext, dpi)
 
     if ext == ".pdf":
-        return _load_pdf(path, dpi)
-    if ext in {".tif", ".tiff"}:
-        return _load_tiff(path, dpi)
-    if ext in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
-        return _load_single_image(path)
+        pages = _load_pdf(path, dpi)
+    elif ext in {".tif", ".tiff"}:
+        pages = _load_tiff(path, dpi)
+    elif ext in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}:
+        pages = _load_single_image(path)
+    else:
+        raise ValueError(
+            f"Unsupported format: {ext}. Use .pdf, .tif, .tiff, or common image formats."
+        )
 
-    raise ValueError(
-        f"Unsupported format: {ext}. Use .pdf, .tif, .tiff, or common image formats."
+    for page in pages:
+        log.debug(
+            "Page %d: %dx%d px (rasterized for OCR)",
+            page.page_index,
+            page.width,
+            page.height,
+        )
+    log.info(
+        "Loaded %d page(s) — all pages rasterized to images; OCR runs on pixels "
+        "(no PDF text-layer extraction)",
+        len(pages),
     )
+    return pages

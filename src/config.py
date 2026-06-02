@@ -3,6 +3,13 @@
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOG_LEVEL = "INFO"
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LOG_FILE: Path | None = None  # e.g. Path("logs/extraction.log")
+
+# ---------------------------------------------------------------------------
 # OCR
 # ---------------------------------------------------------------------------
 OCR_LANGUAGES = ["en"]
@@ -14,6 +21,19 @@ OCR_ROUTER_FALLBACK_MEAN_CONF = 0.45
 OCR_ENSEMBLE_AGREEMENT_BOOST = 0.08
 # Minimum fraction of boxes that must agree to apply ensemble boost.
 OCR_ENSEMBLE_MIN_AGREEMENT_RATIO = 0.35
+
+# Ground-truth OCR accuracy (CER/WER vs reference text).
+# Requires reference from ground-truth files and/or PDF text layer (auto mode).
+OCR_ACCURACY_ENABLED = True
+# auto | ground_truth | pdf_text | none
+OCR_ACCURACY_REFERENCE_MODE = "auto"
+OCR_ACCURACY_MIN_REFERENCE_CHARS = 20
+OCR_GROUND_TRUTH_SUFFIX = "_ground_truth.txt"
+# Project folder for ground-truth files (works with API UUID uploads).
+OCR_GROUND_TRUTH_DIR = Path(__file__).resolve().parent.parent / "ground_truth"
+# Measure RapidOCR specifically (always) plus pipeline router result when different.
+OCR_ACCURACY_MEASURE_RAPID = True
+OCR_ACCURACY_MEASURE_PIPELINE = True
 
 # ---------------------------------------------------------------------------
 # Keyword extraction (YAKE)

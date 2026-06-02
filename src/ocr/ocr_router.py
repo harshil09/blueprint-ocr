@@ -7,9 +7,12 @@ import re
 import numpy as np
 
 from src import config
+from src.logger import get_logger
 from src.ocr.ocr_engine import OcrEngine, OcrPageResult, TextBox
 from src.ocr.paddle_engine import PaddleOcrEngine
 from src.utils import bbox_iou, mean_box_confidence, normalize_confidence
+
+log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +117,45 @@ def mean_page_confidence(result: OcrPageResult) -> float:
     return mean_box_confidence(result.boxes)
 
 
+def ocr_confidence_stats(result: OcrPageResult) -> dict[str, float | int]:
+    """
+    Summarize per-page OCR quality from engine-reported box confidences.
+
+    This is not ground-truth accuracy (no reference text to compare against).
+    Low values suggest the engine was uncertain; use Paddle fallback and manual
+    review when mean confidence or low_confidence_ratio is high.
+    """
+    if not result.boxes:
+        return {
+            "box_count": 0,
+            "char_count": len(result.full_text),
+            "mean_confidence": 0.0,
+            "min_confidence": 0.0,
+            "max_confidence": 0.0,
+            "median_confidence": 0.0,
+            "low_confidence_boxes": 0,
+            "low_confidence_ratio": 0.0,
+        }
+
+    confs = sorted(normalize_confidence(b.confidence) for b in result.boxes)
+    threshold = config.OCR_ROUTER_FALLBACK_MEAN_CONF
+    low_count = sum(1 for c in confs if c < threshold)
+    n = len(confs)
+    mid = n // 2
+    median = confs[mid] if n % 2 else (confs[mid - 1] + confs[mid]) / 2
+
+    return {
+        "box_count": n,
+        "char_count": len(result.full_text),
+        "mean_confidence": round(sum(confs) / n, 4),
+        "min_confidence": round(confs[0], 4),
+        "max_confidence": round(confs[-1], 4),
+        "median_confidence": round(median, 4),
+        "low_confidence_boxes": low_count,
+        "low_confidence_ratio": round(low_count / n, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
@@ -141,8 +183,16 @@ class OcrRouter:
         big_page = max(h, w) >= config.REGION_OCR_MIN_SIDE_PX
 
         if not (self.enable_regions and big_page):
+            log.debug("RapidOCR full-page mode (%dx%d)", w, h)
             return self.primary.recognize_page(image_bgr)
 
+        log.info(
+            "RapidOCR regional mode: page %dx%d split into %dx%d grid",
+            w,
+            h,
+            config.REGION_OCR_GRID_ROWS,
+            config.REGION_OCR_GRID_COLS,
+        )
         regions = split_page_regions(
             w,
             h,
@@ -153,34 +203,75 @@ class OcrRouter:
         parts = [self.primary.recognize_region(image_bgr, box) for box in regions]
         return merge_region_ocr_results(parts, engine="rapid")
 
-    def _should_use_paddle(self, rapid_result: OcrPageResult) -> bool:
+    def _should_use_paddle(self, rapid_result: OcrPageResult) -> tuple[bool, str]:
         if not self.enable_fallback:
-            return False
+            return False, "fallback disabled"
         if rapid_result.box_count == 0:
-            return True
-        return mean_page_confidence(rapid_result) < config.OCR_ROUTER_FALLBACK_MEAN_CONF
+            return True, "RapidOCR found no text boxes"
+        mean_conf = mean_page_confidence(rapid_result)
+        if mean_conf < config.OCR_ROUTER_FALLBACK_MEAN_CONF:
+            return (
+                True,
+                f"RapidOCR mean confidence {mean_conf:.3f} "
+                f"< threshold {config.OCR_ROUTER_FALLBACK_MEAN_CONF}",
+            )
+        return False, "RapidOCR confidence acceptable"
 
     def recognize_page(self, image_bgr: np.ndarray) -> OcrPageResult:
         rapid = self._ocr_with_rapid(image_bgr)
+        rapid_stats = ocr_confidence_stats(rapid)
+        log.info(
+            "RapidOCR: boxes=%d chars=%d mean_conf=%.3f min=%.3f max=%.3f "
+            "low_conf_ratio=%.2f",
+            rapid_stats["box_count"],
+            rapid_stats["char_count"],
+            rapid_stats["mean_confidence"],
+            rapid_stats["min_confidence"],
+            rapid_stats["max_confidence"],
+            rapid_stats["low_confidence_ratio"],
+        )
 
-        if not self._should_use_paddle(rapid):
+        use_paddle, reason = self._should_use_paddle(rapid)
+        if not use_paddle:
+            log.info("Using RapidOCR result (%s)", reason)
             return rapid
 
+        log.info("PaddleOCR fallback triggered: %s", reason)
         try:
             paddle = self.fallback.recognize_page(image_bgr)
-        except Exception:
+        except Exception as exc:
+            log.warning("PaddleOCR failed (%s); keeping RapidOCR result", exc)
             return rapid
+
+        paddle_stats = ocr_confidence_stats(paddle)
+        log.info(
+            "PaddleOCR: boxes=%d chars=%d mean_conf=%.3f min=%.3f max=%.3f",
+            paddle_stats["box_count"],
+            paddle_stats["char_count"],
+            paddle_stats["mean_confidence"],
+            paddle_stats["min_confidence"],
+            paddle_stats["max_confidence"],
+        )
 
         rapid_score = mean_page_confidence(rapid)
         paddle_score = mean_page_confidence(paddle)
         if paddle_score > rapid_score + 0.02:
             best = paddle
             other = rapid
+            winner = "paddle"
         else:
             best = rapid
             other = paddle
+            winner = "rapid"
 
         agree = agreement_ratio(best, other)
+        log.info(
+            "Engine selection: %s (rapid=%.3f paddle=%.3f agreement=%.2f)",
+            winner,
+            rapid_score,
+            paddle_score,
+            agree,
+        )
         return boost_confidence_on_agreement(
             best,
             agreement=agree,

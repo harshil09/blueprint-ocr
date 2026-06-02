@@ -23,9 +23,11 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 def _run_local_pipeline(uploaded_file) -> dict:
-    from src import config
+    from src.logger import setup_logging
     from src.ocr.ocr_router import OcrRouter
     from src.pipeline import ExtractionPipeline
+
+    setup_logging()
 
     upload_dir = _ROOT / "uploads"
     output_dir = _ROOT / "outputs"
@@ -37,7 +39,7 @@ def _run_local_pipeline(uploaded_file) -> dict:
     upload_path.write_bytes(uploaded_file.getvalue())
 
     pipeline = ExtractionPipeline(ocr_engine=OcrRouter(), output_dir=output_dir)
-    result = pipeline.process(upload_path)
+    result = pipeline.process(upload_path, original_filename=uploaded_file.name)
 
     return {
         "status": "success",
@@ -45,6 +47,7 @@ def _run_local_pipeline(uploaded_file) -> dict:
         "figures_count": len(result.figures),
         "output_dir": str(result.output_dir),
         "figures": result.figures,
+        "ocr_accuracy": result.ocr_accuracy_summary,
         "pages": [
             {
                 "page_index": p.page_index,
@@ -52,6 +55,8 @@ def _run_local_pipeline(uploaded_file) -> dict:
                 "ocr_mean_confidence": p.ocr_mean_confidence,
                 "engineering_figure_path": p.engineering_figure_path,
                 "keyword_count": len(p.keyword_list),
+                "rapid_ocr_accuracy": p.rapid_ocr_accuracy,
+                "pipeline_ocr_accuracy": p.pipeline_ocr_accuracy,
             }
             for p in result.pages
         ],
@@ -104,6 +109,42 @@ def _render_results(data: dict) -> None:
     if pages:
         st.subheader("Per-page OCR")
         st.dataframe(pages, use_container_width=True, hide_index=True)
+
+    ocr_accuracy = data.get("ocr_accuracy")
+    if ocr_accuracy:
+        st.subheader("OCR accuracy / quality")
+        status = ocr_accuracy.get("status", "unknown")
+        if status == "measured":
+            rapid = ocr_accuracy.get("rapid_ocr") or {}
+            st.success(
+                f"Ground-truth accuracy measured ({ocr_accuracy.get('reference_source')}). "
+                f"Char: **{(rapid.get('mean_char_accuracy') or 0) * 100:.1f}%** · "
+                f"Word: **{(rapid.get('mean_word_accuracy') or 0) * 100:.1f}%**"
+            )
+        else:
+            st.warning(
+                "Ground-truth accuracy not available (scanned PDF or no reference file). "
+                "See `ocr_accuracy.json` in the output folder for confidence proxy metrics."
+            )
+            proxy = ocr_accuracy.get("confidence_proxy") or {}
+            summary = proxy.get("summary") or {}
+            if summary.get("mean_confidence") is not None:
+                st.metric(
+                    "OCR confidence proxy (not accuracy)",
+                    f"{summary['mean_confidence'] * 100:.1f}%",
+                    help="Engine-reported confidence. Add a ground-truth file for real accuracy.",
+                )
+            hints = ocr_accuracy.get("how_to_enable_accuracy") or []
+            if hints:
+                st.caption("To enable real accuracy, add ground truth at:")
+                for hint in hints:
+                    st.code(hint, language=None)
+
+    output_dir = data.get("output_dir")
+    if output_dir:
+        accuracy_path = Path(output_dir) / "ocr_accuracy.json"
+        if accuracy_path.is_file():
+            st.caption(f"Full report: `{accuracy_path}`")
 
     figures = data.get("figures")
     if figures:

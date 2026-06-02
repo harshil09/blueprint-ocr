@@ -1,0 +1,69 @@
+# AUTO-SAVED GROUND TRUTH DRAFT (from OCR output)
+# Document: aircraft_unstructured_document.pdf
+# Review and correct OCR mistakes, then re-run extraction to measure accuracy.
+# This draft is NOT accurate until you edit it.
+
+Project'Kestrel
+CONFIDENTIAL
+Assembly  Line
+Ref:MK-454-22
+Sheet 7B
+DO NOT COPY
+Date: 17/04/23
+Fuselage  Integration
+Stage  3
+Internal  Use  Only
+Checkpoints :
+Wing alignment
+Avionics  Bay
+Hydraulic  Lines
+Fuel  System
+Note:
+Torque specs
+updated
+See Pg-
+/2
+Next   Review
+24/04/23
+米
+Verify
+rivet
+wo  wood
+Section  C
+ASAP
+Issue:
+QTY
+Reminder:
+Tool List :
+PART NO.
+DESCRIPTION
+Hydraulic eak
+FUS-8831-01
+FUSELAGE ASSY
+1
+Calibrate  tools
+-Rivet Gun(RG-77)
+2
+found in Line 3B
+WNG-5542-02
+WING ASSEMBLY
+1
+before  starting
+Torque Wrench (20-200 Wm)
+during  +est  on
+TANK-7721-03
+FUELTANK（INT)
+1
+morning
+shift.
+Drill Set (1/8"- 1/2")
+LANDING GEAR SET
+16/04/23
+LG-2001-04
+AVIONICS PACKAGE
+1
+Hydraulic Tester (HT-55)
+Resolved.
+AVL-1100-05
+30/04/23
+Target completion  for  this batch :
