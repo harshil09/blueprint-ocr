@@ -15,6 +15,9 @@ import pymupdf as fitz
 from src import config
 from src.extract_figure import (
     estimate_text_coverage_in_bbox,
+    finalize_crop_bounds,
+    find_main_drawing_bbox_via_projection,
+    is_valid_figure_crop,
     masked_non_text_edges,
 )
 from src.logger import get_logger
@@ -110,6 +113,65 @@ def extract_embedded_pdf_images(
 # ---------------------------------------------------------------------------
 
 
+def _is_valid_photo_bbox(
+    bbox: tuple[int, int, int, int],
+    page_shape: tuple[int, int],
+) -> bool:
+    """Reject manufacturing-photo false positives (edge slivers, tiny strips)."""
+    ph, pw = page_shape
+    x0, y0, x1, y1 = bbox
+    bw, bh = x1 - x0, y1 - y0
+    return is_valid_figure_crop((x0, y0, bw, bh), page_shape)
+
+
+def extract_projection_figure(
+    source_path: Path,
+    page_index: int,
+    image_bgr: np.ndarray,
+    text_boxes: list[TextBox],
+    output_dir: Path,
+) -> list[ExtractedFigure]:
+    """Edge-projection fallback when morphology did not produce a figure."""
+    box = find_main_drawing_bbox_via_projection(image_bgr, text_boxes)
+    if box is None or not is_valid_figure_crop(box, image_bgr.shape[:2]):
+        return []
+
+    x, y, bw, bh = box
+    x1, y1, x2, y2 = finalize_crop_bounds(
+        image_bgr, x, y, x + bw, y + bh, text_boxes
+    )
+    crop = image_bgr[y1:y2, x1:x2]
+    out_path = (
+        output_dir
+        / f"{source_path.stem}_p{page_index:03d}_projection.{config.OUTPUT_IMAGE_FORMAT}"
+    )
+    save_bgr(out_path, crop)
+    return [
+        ExtractedFigure(
+            source_path=source_path,
+            page_index=page_index,
+            figure_index=0,
+            image_path=out_path,
+            method="projection",
+            bbox=(x1, y1, x2, y2),
+            area_ratio=((x2 - x1) * (y2 - y1))
+            / (image_bgr.shape[0] * image_bgr.shape[1]),
+        )
+    ]
+
+
+def _is_engineering_line_drawing(image_bgr: np.ndarray) -> bool:
+    """Low-saturation pages with dense line work (CAD / scanned drawings)."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    mean_sat = float(hsv[:, :, 1].mean())
+    if mean_sat > config.PHOTO_SATURATION_MAX + 15:
+        return False
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    edge_density = float(np.count_nonzero(edges) / max(edges.size, 1))
+    return edge_density >= 0.02
+
+
 def _find_layout_figures(
     image_bgr: np.ndarray,
     text_boxes: list[TextBox],
@@ -130,6 +192,8 @@ def _find_layout_figures(
         x, y, cw, ch = cv2.boundingRect(cnt)
         area = cw * ch
         if area < min_area:
+            continue
+        if area / page_area > config.MAX_FIGURE_OUTPUT_AREA_RATIO + 0.05:
             continue
         aspect = cw / max(ch, 1)
         if aspect < 0.15 or aspect > 8.0:
@@ -284,12 +348,17 @@ def extract_manufacturing_photo(
     page_index: int,
     image_bgr: np.ndarray,
     output_dir: Path,
+    text_boxes: list[TextBox] | None = None,
 ) -> list[ExtractedFigure]:
     found = _find_manufacturing_photo_bbox(image_bgr)
     if not found:
         return []
     bbox, area_ratio = found
+    if not _is_valid_photo_bbox(bbox, image_bgr.shape[:2]):
+        log.debug("Manufacturing photo bbox rejected (invalid crop geometry)")
+        return []
     x0, y0, x1, y1 = bbox
+    x0, y0, x1, y1 = finalize_crop_bounds(image_bgr, x0, y0, x1, y1, text_boxes)
     crop = image_bgr[y0:y1, x0:x1]
     out_path = (
         output_dir
@@ -322,7 +391,16 @@ def extract_layout_figures(
     figures: list[ExtractedFigure] = []
     for idx, (bbox, area_ratio) in enumerate(regions):
         x0, y0, x1, y1 = bbox
+        if not _is_valid_photo_bbox(bbox, image_bgr.shape[:2]):
+            continue
+        x0, y0, x1, y1 = finalize_crop_bounds(
+            image_bgr, x0, y0, x1, y1, text_boxes
+        )
+        final_bbox = (x0, y0, x1, y1)
+        if not _is_valid_photo_bbox(final_bbox, image_bgr.shape[:2]):
+            continue
         crop = image_bgr[y0:y1, x0:x1]
+        area_ratio = (x1 - x0) * (y1 - y0) / (image_bgr.shape[0] * image_bgr.shape[1])
         out_path = (
             output_dir
             / f"{source_path.stem}_p{page_index:03d}_figure_{idx:03d}.{config.OUTPUT_IMAGE_FORMAT}"
@@ -335,7 +413,7 @@ def extract_layout_figures(
                 figure_index=idx,
                 image_path=out_path,
                 method="layout",
-                bbox=bbox,
+                bbox=final_bbox,
                 area_ratio=area_ratio,
             )
         )
@@ -388,9 +466,32 @@ def extract_all_figures(
             )
             continue
 
-        photos = extract_manufacturing_photo(
-            page.source_path, page.page_index, page.image, img_dir
+        projection_figs = extract_projection_figure(
+            page.source_path,
+            page.page_index,
+            page.image,
+            ocr.boxes,
+            img_dir,
         )
+        if projection_figs:
+            log.info("Page %d: projection figure extracted", page.page_index)
+            figures.extend(projection_figs)
+            continue
+
+        if _is_engineering_line_drawing(page.image):
+            log.debug(
+                "Page %d: skipping manufacturing-photo heuristic (engineering line drawing)",
+                page.page_index,
+            )
+            photos = []
+        else:
+            photos = extract_manufacturing_photo(
+                page.source_path,
+                page.page_index,
+                page.image,
+                img_dir,
+                text_boxes=ocr.boxes,
+            )
         if photos:
             bbox = photos[0].bbox
             if bbox is not None:
