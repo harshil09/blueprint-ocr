@@ -31,7 +31,15 @@ from src.figure_fusion import (
     build_candidate_from_crop,
     classify_page,
     crop_completeness_score,
+    score_candidate,
     select_primary_candidate,
+)
+from src.profile_config import (
+    CropProfile,
+    ProfileConfig,
+    get_profile_config,
+    log_page_profile_assignment,
+    resolve_crop_profile,
 )
 from src.logger import get_logger
 from src.ocr.ocr_engine import OcrPageResult, TextBox
@@ -52,6 +60,7 @@ class ExtractedFigure:
     figure_type: str = "line_art"
     confidence: float = 0.0
     page_profile: str = ""
+    crop_profile: str = ""
     text_overlap: float = 0.0
     completeness: float = 0.0
     is_primary: bool = True
@@ -95,12 +104,15 @@ def _skip_embedded_for_fusion(
     page_width: int,
     page_height: int,
     area_ratio: float,
+    *,
+    pcfg: ProfileConfig | None = None,
 ) -> bool:
     """Omit full-page embedded rasters so raster line-art crops are preferred."""
-    if area_ratio > config.EMBEDDED_FUSION_MAX_AREA_RATIO:
+    active = pcfg or get_profile_config(CropProfile.SCANNED_PDF)
+    if area_ratio > active.embedded_fusion_max_area_ratio:
         return True
     if page_width > 0 and page_height > 0:
-        dim_ratio = config.EMBEDDED_FUSION_MIN_PAGE_DIMENSION_RATIO
+        dim_ratio = active.embedded_fusion_min_page_dimension_ratio
         if (
             img_width >= page_width * dim_ratio
             or img_height >= page_height * dim_ratio
@@ -127,6 +139,8 @@ def _is_full_page_embedded(
 def _embedded_candidates_by_page(
     pdf_path: Path,
     page_sizes: list[tuple[int, int]],
+    *,
+    pcfg_by_page: dict[int, ProfileConfig] | None = None,
 ) -> dict[int, list[FigureCandidate]]:
     threshold = config.MIN_EMBEDDED_IMAGE_BYTES
     skip_full = config.SKIP_FULL_PAGE_EMBEDDED
@@ -149,7 +163,10 @@ def _embedded_candidates_by_page(
                     continue
                 page_area = max(pw * ph, 1)
                 area_ratio = (iw * ih) / page_area if pw and ph else 0.3
-                if _skip_embedded_for_fusion(iw, ih, pw, ph, area_ratio):
+                page_pcfg = (pcfg_by_page or {}).get(page_i)
+                if _skip_embedded_for_fusion(
+                    iw, ih, pw, ph, area_ratio, pcfg=page_pcfg
+                ):
                     log.debug(
                         "Skipping embedded scan for fusion page %d (%dx%d, %.1f%% of page)",
                         page_i,
@@ -192,17 +209,21 @@ def _is_valid_photo_bbox(
     *,
     image_bgr: np.ndarray | None = None,
     text_boxes: list[TextBox] | None = None,
+    profile_config: ProfileConfig | None = None,
 ) -> bool:
     x0, y0, x1, y1 = bbox
     bw, bh = x1 - x0, y1 - y0
     density = None
     if image_bgr is not None:
-        density = line_art_density_in_bbox(image_bgr, bbox, text_boxes)
+        density = line_art_density_in_bbox(
+            image_bgr, bbox, text_boxes, profile_config=profile_config
+        )
     return is_valid_figure_crop(
         (x0, y0, bw, bh),
         page_shape,
         profile,
         line_art_density=density,
+        profile_config=profile_config,
     )
 
 
@@ -393,6 +414,8 @@ def _collect_projection_candidate(
     image_bgr: np.ndarray,
     text_boxes: list[TextBox],
     profile: PageProfile,
+    *,
+    profile_config: ProfileConfig,
 ) -> FigureCandidate | None:
     box = find_main_drawing_bbox_via_projection(image_bgr, text_boxes)
     if box is None:
@@ -400,7 +423,14 @@ def _collect_projection_candidate(
 
     x1, y1, x2, y2 = _pad_detection_bbox_xyxy(box, image_bgr.shape[:2])
     prepared = prepare_primary_crop(
-        image_bgr, x1, y1, x2, y2, text_boxes, profile=profile
+        image_bgr,
+        x1,
+        y1,
+        x2,
+        y2,
+        text_boxes,
+        profile=profile,
+        profile_config=profile_config,
     )
     if prepared is None:
         return None
@@ -424,6 +454,8 @@ def _collect_photo_candidate(
     image_bgr: np.ndarray,
     text_boxes: list[TextBox],
     profile: PageProfile,
+    *,
+    profile_config: ProfileConfig,
 ) -> FigureCandidate | None:
     if profile == PageProfile.ENGINEERING_SHEET and _is_engineering_line_drawing(image_bgr):
         return None
@@ -436,7 +468,14 @@ def _collect_photo_candidate(
     x0, y0, x1, y1 = bbox
     x0, y0, x1, y1 = finalize_crop_bounds(image_bgr, x0, y0, x1, y1, text_boxes)
     prepared = prepare_primary_crop(
-        image_bgr, x0, y0, x1, y1, text_boxes, profile=profile
+        image_bgr,
+        x0,
+        y0,
+        x1,
+        y1,
+        text_boxes,
+        profile=profile,
+        profile_config=profile_config,
     )
     if prepared is None:
         return None
@@ -464,6 +503,8 @@ def _collect_layout_candidate(
     image_bgr: np.ndarray,
     text_boxes: list[TextBox],
     profile: PageProfile,
+    *,
+    profile_config: ProfileConfig,
 ) -> FigureCandidate | None:
     regions = _find_layout_figures(image_bgr, text_boxes, config.MIN_FIGURE_AREA_RATIO)
     if not regions:
@@ -473,7 +514,14 @@ def _collect_layout_candidate(
     x0, y0, x1, y1 = bbox
     x0, y0, x1, y1 = finalize_crop_bounds(image_bgr, x0, y0, x1, y1, text_boxes)
     prepared = prepare_primary_crop(
-        image_bgr, x0, y0, x1, y1, text_boxes, profile=profile
+        image_bgr,
+        x0,
+        y0,
+        x1,
+        y1,
+        text_boxes,
+        profile=profile,
+        profile_config=profile_config,
     )
     if prepared is None:
         return None
@@ -498,6 +546,8 @@ def _collect_morphology_candidate(
     text_boxes: list[TextBox],
     morph: MorphologyPageCandidate | None,
     profile: PageProfile,
+    *,
+    profile_config: ProfileConfig,
 ) -> FigureCandidate | None:
     if morph is None:
         return None
@@ -505,7 +555,7 @@ def _collect_morphology_candidate(
     x1, y1, x2, y2 = morph.bbox
     page_area = image_bgr.shape[0] * image_bgr.shape[1]
     morph_area = (x2 - x1) * (y2 - y1) / max(page_area, 1)
-    if morph_area > config.MAX_FIGURE_OUTPUT_AREA_RATIO * 0.88:
+    if morph_area > profile_config.max_figure_output_area_ratio * 0.88:
         log.debug(
             "Morphology area %.1f%% too large on page %d — deferring to other extractors",
             100 * morph_area,
@@ -514,7 +564,14 @@ def _collect_morphology_candidate(
         return None
 
     prepared = prepare_primary_crop(
-        image_bgr, x1, y1, x2, y2, text_boxes, profile=profile
+        image_bgr,
+        x1,
+        y1,
+        x2,
+        y2,
+        text_boxes,
+        profile=profile,
+        profile_config=profile_config,
     )
     if prepared is None:
         return None
@@ -542,25 +599,50 @@ def _collect_page_candidates(
     profile: PageProfile,
     morph: MorphologyPageCandidate | None,
     embedded: list[FigureCandidate],
+    *,
+    profile_config: ProfileConfig,
 ) -> list[FigureCandidate]:
     text_boxes = ocr.boxes
     candidates: list[FigureCandidate] = []
 
     morph_cand = _collect_morphology_candidate(
-        page_index, image_bgr, text_boxes, morph, profile
+        page_index,
+        image_bgr,
+        text_boxes,
+        morph,
+        profile,
+        profile_config=profile_config,
     )
     if morph_cand is not None:
         candidates.append(morph_cand)
 
-    proj = _collect_projection_candidate(page_index, image_bgr, text_boxes, profile)
+    proj = _collect_projection_candidate(
+        page_index,
+        image_bgr,
+        text_boxes,
+        profile,
+        profile_config=profile_config,
+    )
     if proj is not None:
         candidates.append(proj)
 
-    photo = _collect_photo_candidate(page_index, image_bgr, text_boxes, profile)
+    photo = _collect_photo_candidate(
+        page_index,
+        image_bgr,
+        text_boxes,
+        profile,
+        profile_config=profile_config,
+    )
     if photo is not None:
         candidates.append(photo)
 
-    layout = _collect_layout_candidate(page_index, image_bgr, text_boxes, profile)
+    layout = _collect_layout_candidate(
+        page_index,
+        image_bgr,
+        text_boxes,
+        profile,
+        profile_config=profile_config,
+    )
     if layout is not None:
         candidates.append(layout)
 
@@ -573,6 +655,9 @@ def _save_primary_candidate(
     candidate: FigureCandidate,
     out_path: Path,
     profile: PageProfile,
+    *,
+    crop_profile: CropProfile,
+    profile_config: ProfileConfig,
 ) -> ExtractedFigure:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -586,9 +671,7 @@ def _save_primary_candidate(
     else:
         raise ValueError(f"Candidate {candidate.method} has no image data")
 
-    from src.figure_fusion import score_candidate
-
-    confidence = score_candidate(candidate, profile)
+    confidence = score_candidate(candidate, profile, pcfg=profile_config)
     return ExtractedFigure(
         source_path=source_path,
         page_index=candidate.page_index,
@@ -600,6 +683,7 @@ def _save_primary_candidate(
         figure_type=candidate.figure_type.value,
         confidence=round(confidence, 4),
         page_profile=profile.value,
+        crop_profile=crop_profile.value,
         text_overlap=round(candidate.text_overlap, 4),
         completeness=round(candidate.completeness, 4),
         is_primary=True,
@@ -625,27 +709,50 @@ def extract_primary_figures(
     img_dir = output_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    embedded_by_page: dict[int, list[FigureCandidate]] = {}
-    if source_path.suffix.lower() == ".pdf":
-        embedded_by_page = _embedded_candidates_by_page(source_path, page_sizes)
-
-    primary_figures: list[ExtractedFigure] = []
+    is_pdf = source_path.suffix.lower() == ".pdf"
+    page_profiles: dict[int, PageProfile] = {}
+    crop_profiles: dict[int, CropProfile] = {}
+    pcfg_by_page: dict[int, ProfileConfig] = {}
 
     for page, ocr in zip(pages, ocr_results):
-        embedded_count = len(embedded_by_page.get(page.page_index, []))
         profile = classify_page(
             page.image,
             ocr,
             page_count=page_count,
-            embedded_on_page=embedded_count,
-            is_pdf=source_path.suffix.lower() == ".pdf",
+            embedded_on_page=0,
+            is_pdf=is_pdf,
         )
-        log.info(
-            "Page %d: profile=%s embedded=%d",
-            page.page_index,
-            profile.value,
-            embedded_count,
+        page_profiles[page.page_index] = profile
+        morph = morphology_by_page.get(page.page_index)
+        seed_bbox = morph.bbox if morph is not None else None
+        crop_profile = resolve_crop_profile(
+            profile,
+            page.image,
+            ocr,
+            seed_bbox_xyxy=seed_bbox,
+            is_pdf=is_pdf,
+            embedded_on_page=0,
+            page_count=page_count,
+            source_suffix=source_path.suffix,
         )
+        crop_profiles[page.page_index] = crop_profile
+        pcfg_by_page[page.page_index] = get_profile_config(crop_profile)
+
+    embedded_by_page: dict[int, list[FigureCandidate]] = {}
+    if is_pdf:
+        embedded_by_page = _embedded_candidates_by_page(
+            source_path, page_sizes, pcfg_by_page=pcfg_by_page
+        )
+
+    primary_figures: list[ExtractedFigure] = []
+
+    for page, ocr in zip(pages, ocr_results):
+        profile = page_profiles[page.page_index]
+        crop_profile = crop_profiles[page.page_index]
+        pcfg = pcfg_by_page[page.page_index]
+        embedded_count = len(embedded_by_page.get(page.page_index, []))
+        morph = morphology_by_page.get(page.page_index)
+        seed_bbox = morph.bbox if morph is not None else None
 
         candidates = _collect_page_candidates(
             page.page_index,
@@ -654,16 +761,40 @@ def extract_primary_figures(
             profile,
             morphology_by_page.get(page.page_index),
             embedded_by_page.get(page.page_index, []),
+            profile_config=pcfg,
         )
 
-        winner = select_primary_candidate(candidates, profile)
+        winner = select_primary_candidate(
+            candidates, profile, pcfg=pcfg, crop_profile=crop_profile
+        )
+
+        log_page_profile_assignment(
+            source_path=source_path,
+            page_index=page.page_index,
+            page_profile=profile.value,
+            crop_profile=crop_profile,
+            pcfg=pcfg,
+            page_size=(page.width, page.height),
+            seed_bbox_xyxy=seed_bbox,
+            embedded_count=embedded_count,
+            figure_method=winner.method if winner else None,
+            figure_emitted=winner is not None,
+        )
+
         if winner is None:
             log.info("Page %d: no primary figure emitted", page.page_index)
             continue
 
         out_path = primary_figure_path(output_dir, page.page_index, page_count)
         primary_figures.append(
-            _save_primary_candidate(source_path, winner, out_path, profile)
+            _save_primary_candidate(
+                source_path,
+                winner,
+                out_path,
+                profile,
+                crop_profile=crop_profile,
+                profile_config=pcfg,
+            )
         )
 
     log.info(

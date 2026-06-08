@@ -17,6 +17,14 @@ from src import config
 from src.extract_figure import estimate_text_coverage_in_bbox
 from src.logger import get_logger
 from src.ocr.ocr_engine import OcrPageResult
+from src.profile_config import (
+    CropProfile,
+    ProfileConfig,
+    default_crop_profile,
+    get_profile_config,
+    resolve_crop_profile,
+    resolve_profile_config,
+)
 from src.utils import bbox_iou
 
 log = get_logger(__name__)
@@ -57,14 +65,25 @@ class FigureCandidate:
 
     @property
     def composite_score(self) -> float:
-        text_penalty = max(0.0, 1.0 - self.text_overlap / max(config.PRIMARY_FIGURE_MAX_TEXT_OVERLAP, 1e-6))
-        if self.text_overlap > config.PRIMARY_FIGURE_MAX_TEXT_OVERLAP:
-            text_penalty *= 0.4
-        # Soft completeness: never zero-out a candidate with a valid gate score.
-        completeness_factor = 0.5 + 0.5 * min(1.0, max(0.0, self.completeness))
-        quality_factor = 1.0 if self.quality_passed else 0.88
-        base = self.gate_score * 0.45 + self.component_score * 0.15 + text_penalty * 0.25
-        return base * completeness_factor * quality_factor
+        """Backward-compatible score using the mixed-datasheet profile defaults."""
+        return candidate_composite_score(
+            self, get_profile_config(CropProfile.MIXED_DATASHEET)
+        )
+
+
+def candidate_composite_score(candidate: FigureCandidate, pcfg: ProfileConfig) -> float:
+    max_text = max(pcfg.primary_figure_max_text_overlap, 1e-6)
+    text_penalty = max(0.0, 1.0 - candidate.text_overlap / max_text)
+    if candidate.text_overlap > pcfg.primary_figure_max_text_overlap:
+        text_penalty *= 0.4
+    completeness_factor = 0.5 + 0.5 * min(1.0, max(0.0, candidate.completeness))
+    quality_factor = 1.0 if candidate.quality_passed else 0.88
+    base = (
+        candidate.gate_score * 0.45
+        + candidate.component_score * 0.15
+        + text_penalty * 0.25
+    )
+    return base * completeness_factor * quality_factor
 
 
 def _page_text_coverage(ocr: OcrPageResult, page_shape: tuple[int, int]) -> float:
@@ -101,8 +120,11 @@ def classify_page(
     is_pdf: bool = False,
 ) -> PageProfile:
     ph, pw = image_bgr.shape[:2]
+    text_heavy_pcfg = get_profile_config(CropProfile.TEXT_HEAVY)
+    eng_pcfg = get_profile_config(CropProfile.BLUEPRINT_LARGE)
+
     text_cov = _page_text_coverage(ocr, (ph, pw))
-    if text_cov >= config.PAGE_TEXT_HEAVY_COVERAGE_RATIO and _edge_density(image_bgr) < 0.015:
+    if text_cov >= text_heavy_pcfg.page_text_heavy_coverage_ratio and _edge_density(image_bgr) < 0.015:
         return PageProfile.TEXT_HEAVY
 
     edge_density = _edge_density(image_bgr)
@@ -114,14 +136,30 @@ def classify_page(
             return PageProfile.ENGINEERING_SHEET
         return PageProfile.DIGITAL_PDF
 
-    if page_count == 1 and edge_density >= config.ENGINEERING_EDGE_DENSITY_MIN:
+    # Full CAD sheets with title block / notes (landscape, many OCR boxes).
+    page_aspect = pw / max(ph, 1)
+    ocr_box_count = len(ocr.boxes)
+    if (
+        page_count == 1
+        and page_aspect >= 1.15
+        and ocr_box_count >= 15
+        and edge_density >= 0.012
+    ):
+        return PageProfile.ENGINEERING_SHEET
+
+    # Isolated line-art PNG (few labels, no dense title block) → simple raster.
+    if (
+        page_count == 1
+        and edge_density >= eng_pcfg.engineering_edge_density_min
+        and ocr_box_count < 12
+    ):
         return PageProfile.SIMPLE_IMAGE
 
     # Grayscale technical drawings at high DPI have lower edge density per pixel.
     if mean_sat < 12 and edge_density >= 0.008:
         return PageProfile.ENGINEERING_SHEET
 
-    if mean_sat < config.PHOTO_SATURATION_MAX + 10 and edge_density >= config.ENGINEERING_EDGE_DENSITY_MIN:
+    if mean_sat < config.PHOTO_SATURATION_MAX + 10 and edge_density >= eng_pcfg.engineering_edge_density_min:
         return PageProfile.ENGINEERING_SHEET
 
     if mean_sat < config.PHOTO_SATURATION_MAX + 15 and edge_density >= 0.01:
@@ -201,20 +239,25 @@ def crop_completeness_score(
     return max(0.35, sum(scores) / len(scores))
 
 
-def _method_prior(method: str, profile: PageProfile) -> float:
-    if profile in (PageProfile.ENGINEERING_SHEET, PageProfile.SIMPLE_IMAGE, PageProfile.MIXED):
-        priors = config.METHOD_PRIOR_ENGINEERING
-    else:
-        priors = config.METHOD_PRIOR_PHOTO
-    return priors.get(method, 0.6)
+def _method_prior(method: str, pcfg: ProfileConfig) -> float:
+    return pcfg.method_priors.get(method, 0.6)
 
 
-def score_candidate(candidate: FigureCandidate, profile: PageProfile) -> float:
-    prior = _method_prior(candidate.method, profile)
-    score = candidate.composite_score * prior
-    if candidate.area_ratio > 0.48:
-        score *= max(0.55, 0.48 / candidate.area_ratio)
-    if candidate.method == "embedded" and candidate.area_ratio > config.EMBEDDED_FUSION_MAX_AREA_RATIO:
+def score_candidate(
+    candidate: FigureCandidate,
+    profile: PageProfile,
+    *,
+    pcfg: ProfileConfig | None = None,
+) -> float:
+    active = pcfg or resolve_profile_config(default_crop_profile(profile))
+    prior = _method_prior(candidate.method, active)
+    score = candidate_composite_score(candidate, active) * prior
+    if candidate.area_ratio > active.area_penalty_threshold:
+        score *= max(0.55, active.area_penalty_threshold / candidate.area_ratio)
+    if (
+        candidate.method == "embedded"
+        and candidate.area_ratio > active.embedded_fusion_max_area_ratio
+    ):
         score *= 0.35
     return score
 
@@ -223,7 +266,13 @@ def _dedupe_candidates(candidates: list[FigureCandidate]) -> list[FigureCandidat
     if not candidates:
         return []
 
-    ranked = sorted(candidates, key=lambda c: c.composite_score, reverse=True)
+    ranked = sorted(
+        candidates,
+        key=lambda c: candidate_composite_score(
+            c, get_profile_config(CropProfile.MIXED_DATASHEET)
+        ),
+        reverse=True,
+    )
     kept: list[FigureCandidate] = []
     for cand in ranked:
         if cand.bbox is None:
@@ -241,8 +290,13 @@ def _dedupe_candidates(candidates: list[FigureCandidate]) -> list[FigureCandidat
 def select_primary_candidate(
     candidates: list[FigureCandidate],
     profile: PageProfile,
+    *,
+    pcfg: ProfileConfig | None = None,
+    crop_profile: CropProfile | None = None,
 ) -> FigureCandidate | None:
-    if profile == PageProfile.TEXT_HEAVY:
+    active = pcfg or resolve_profile_config(crop_profile or default_crop_profile(profile))
+
+    if profile == PageProfile.TEXT_HEAVY or active.crop_profile == CropProfile.TEXT_HEAVY:
         log.debug("Page profile text_heavy — skipping figure extraction")
         return None
 
@@ -250,33 +304,36 @@ def select_primary_candidate(
     if not pool:
         return None
 
-    scored = [(c, score_candidate(c, profile)) for c in pool]
+    scored = [(c, score_candidate(c, profile, pcfg=active)) for c in pool]
     best, best_score = max(scored, key=lambda item: item[1])
 
-    if best.text_overlap > config.PRIMARY_FIGURE_MAX_TEXT_OVERLAP and best_score < 0.55:
+    if best.text_overlap > active.primary_figure_max_text_overlap and best_score < 0.55:
         log.debug(
             "Best candidate rejected (text_overlap=%.3f score=%.3f)",
             best.text_overlap,
             best_score,
         )
-        alternatives = [c for c, s in scored if c is not best and s >= config.PRIMARY_FIGURE_MIN_CONFIDENCE]
+        alternatives = [
+            c for c, s in scored
+            if c is not best and s >= active.primary_figure_min_confidence
+        ]
         if alternatives:
-            best = max(alternatives, key=lambda c: score_candidate(c, profile))
-            best_score = score_candidate(best, profile)
+            best = max(alternatives, key=lambda c: score_candidate(c, profile, pcfg=active))
+            best_score = score_candidate(best, profile, pcfg=active)
         else:
             return None
 
-    if best.completeness < config.PRIMARY_FIGURE_MIN_COMPLETENESS and best_score < 0.5:
+    if best.completeness < active.primary_figure_min_completeness and best_score < 0.5:
         better = [
             c for c, s in scored
-            if c.completeness >= config.PRIMARY_FIGURE_MIN_COMPLETENESS
-            and s >= config.PRIMARY_FIGURE_MIN_CONFIDENCE
+            if c.completeness >= active.primary_figure_min_completeness
+            and s >= active.primary_figure_min_confidence
         ]
         if better:
-            best = max(better, key=lambda c: score_candidate(c, profile))
-            best_score = score_candidate(best, profile)
+            best = max(better, key=lambda c: score_candidate(c, profile, pcfg=active))
+            best_score = score_candidate(best, profile, pcfg=active)
 
-    if best_score < config.PRIMARY_FIGURE_MIN_CONFIDENCE:
+    if best_score < active.primary_figure_min_confidence:
         fallback_pool = [
             c for c in pool
             if (c.crop is not None or c.embedded_bytes)
@@ -285,7 +342,7 @@ def select_primary_candidate(
         ]
         if fallback_pool:
             best = max(fallback_pool, key=lambda c: c.gate_score)
-            best_score = score_candidate(best, profile)
+            best_score = score_candidate(best, profile, pcfg=active)
             log.info(
                 "Primary figure fallback: method=%s gate=%.3f score=%.3f",
                 best.method,
@@ -297,13 +354,13 @@ def select_primary_candidate(
                 "No primary figure (best %s score=%.3f below threshold %.3f)",
                 best.method,
                 best_score,
-                config.PRIMARY_FIGURE_MIN_CONFIDENCE,
+                active.primary_figure_min_confidence,
             )
             return None
 
     log.info(
         "Primary figure selected: method=%s type=%s score=%.3f gate=%.3f "
-        "text_overlap=%.3f completeness=%.3f profile=%s",
+        "text_overlap=%.3f completeness=%.3f profile=%s crop_profile=%s",
         best.method,
         best.figure_type.value,
         best_score,
@@ -311,6 +368,7 @@ def select_primary_candidate(
         best.text_overlap,
         best.completeness,
         profile.value,
+        active.crop_profile.value,
     )
     return best
 

@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "description": "Labeled figure-crop evaluation set. Add bbox_xyxy after manual review.",
+  "samples": [
+    {
+      "id": "landing_gear_pdf_p0",
+      "source_path": "/home/dell/images/04_landing_gear_assembly.pdf",
+      "page_index": 0,
+      "document_tags": ["cad_compact", "pdf", "engineering"],
+      "notes": "Landing gear assembly — drawing should not be full-page embedded scan.",
+      "expected": {
+        "bbox_xyxy": null,
+        "expect_figure": true,
+        "min_iou": 0.45,
+        "max_text_overlap": 0.25,
+        "max_area_ratio": 0.58,
+        "expected_crop_profile": "blueprint_large"
+      }
+    },
+    {
+      "id": "avionics_bay_pdf_p0",
+      "source_path": "/home/dell/images/05_avionics_bay_layout.pdf",
+      "page_index": 0,
+      "document_tags": ["cad_compact", "pdf", "engineering"],
+      "notes": "Avionics bay layout sheet.",
+      "expected": {
+        "bbox_xyxy": null,
+        "expect_figure": true,
+        "min_iou": 0.45,
+        "max_text_overlap": 0.28,
+        "max_area_ratio": 0.62
+      }
+    },
+    {
+      "id": "gasket_png_p0",
+      "source_path": "/home/dell/images/drawing_04_gasket.png",
+      "page_index": 0,
+      "document_tags": ["cad_compact", "png", "simple_raster"],
+      "notes": "Pre-cropped gasket drawing on white background.",
+      "expected": {
+        "bbox_xyxy": null,
+        "expect_figure": true,
+        "min_iou": 0.40,
+        "max_text_overlap": 0.15,
+        "max_area_ratio": 0.45
+      }
+    },
+    {
+      "id": "wing_rib_png_p0",
+      "source_path": "/home/dell/images/dwg_wing_rib_assembly.png",
+      "page_index": 0,
+      "document_tags": ["cad_wide", "png"],
+      "notes": "Wing rib assembly — may need wide aspect crop profile.",
+      "expected": {
+        "bbox_xyxy": null,
+        "expect_figure": true,
+        "min_iou": 0.40,
+        "max_text_overlap": 0.22,
+        "max_area_ratio": 0.65
+      }
+    },
+    {
+      "id": "scanned_cad_pdf_p0",
+      "source_path": "/home/dell/images/scanned_cad_drawing.pdf",
+      "page_index": 0,
+      "document_tags": ["scanned_pdf", "pdf"],
+      "notes": "Scanned CAD PDF — must not return full-page embedded raster.",
+      "expected": {
+        "bbox_xyxy": null,
+        "expect_figure": true,
+        "min_iou": 0.35,
+        "max_text_overlap": 0.30,
+        "max_area_ratio": 0.55,
+        "expected_crop_profile": "scanned_pdf"
+      }
+    },
+    {
+      "id": "fuselage_png_p0",
+      "source_path": "/home/dell/images/ChatGPT Image May 27, 2026, 12_29_42 PM.png",
+      "page_index": 0,
+      "document_tags": ["cad_wide", "png", "side_view"],
+      "notes": "Wide fuselage side view — high aspect ratio expected.",
+      "expected": {
+        "bbox_xyxy": null,
+        "expect_figure": true,
+        "min_iou": 0.35,
+        "max_text_overlap": 0.20,
+        "max_area_ratio": 0.40,
+        "min_area_ratio": 0.08,
+        "expected_crop_profile": "cad_wide"
+      }
+    }
+  ]
+}

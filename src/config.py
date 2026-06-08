@@ -9,6 +9,12 @@ LOG_LEVEL = "INFO"
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 LOG_FILE: Path | None = None  # e.g. Path("logs/extraction.log")
 
+# Dedicated log for per-image crop profile selection (profile_config.py).
+PROFILE_CONFIG_LOG_ENABLED = True
+PROFILE_CONFIG_LOG_FILE = (
+    Path(__file__).resolve().parent.parent / "logs" / "profile_config.log"
+)
+
 # ---------------------------------------------------------------------------
 # OCR
 # ---------------------------------------------------------------------------

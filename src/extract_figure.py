@@ -14,9 +14,10 @@ import cv2
 import numpy as np
 
 from src import config
-from src.ocr.ocr_engine import TextBox
-from src.utils import bbox_iou, save_bgr
 from src.logger import get_logger
+from src.ocr.ocr_engine import TextBox
+from src.profile_config import CropProfile, ProfileConfig, resolve_profile_config
+from src.utils import bbox_iou, save_bgr
 
 log = get_logger(__name__)
 
@@ -119,19 +120,23 @@ def _clip_padded_bbox(
     )
 
 
-def build_layout_annotation_mask(shape: tuple[int, int]) -> np.ndarray:
+def build_layout_annotation_mask(
+    shape: tuple[int, int],
+    profile_config: ProfileConfig | None = None,
+) -> np.ndarray:
     """Mask typical drawing-sheet annotation zones (notes + title block)."""
+    pcfg = profile_config or resolve_profile_config(None)
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
-    notes_h = int(h * config.NOTES_BLOCK_HEIGHT_RATIO)
-    notes_w = int(w * config.NOTES_BLOCK_WIDTH_RATIO)
+    notes_h = int(h * pcfg.notes_block_height_ratio)
+    notes_w = int(w * pcfg.notes_block_width_ratio)
     mask[:notes_h, :notes_w] = 255
 
-    band_h = int(h * config.BOTTOM_ANNOTATION_BAND_RATIO)
+    band_h = int(h * pcfg.bottom_annotation_band_ratio)
     mask[h - band_h :, :] = 255
 
     title_h = int(h * config.TITLE_BLOCK_HEIGHT_RATIO)
-    title_w = int(w * config.TITLE_BLOCK_WIDTH_RATIO)
+    title_w = int(w * pcfg.title_block_width_ratio)
     mask[h - title_h :, w - title_w :] = 255
     return mask
 
@@ -142,6 +147,7 @@ def build_text_mask(
     padding: int | None = None,
     *,
     include_layout_zones: bool = True,
+    profile_config: ProfileConfig | None = None,
 ) -> np.ndarray:
     """Uint8 mask with OCR text regions and layout annotation zones set to 255."""
     pad = padding if padding is not None else config.TEXT_MASK_PADDING_PX
@@ -152,7 +158,9 @@ def build_text_mask(
         px0, py0, px1, py1 = _clip_padded_bbox(x0, y0, x1, y1, pad, w, h)
         mask[py0:py1, px0:px1] = 255
     if include_layout_zones:
-        mask = cv2.bitwise_or(mask, build_layout_annotation_mask(shape))
+        mask = cv2.bitwise_or(
+            mask, build_layout_annotation_mask(shape, profile_config=profile_config)
+        )
     return mask
 
 
@@ -722,27 +730,26 @@ def _profile_key(profile: str | object | None) -> str | None:
     return str(profile)
 
 
-def _uses_engineering_crop_limits(profile: str | object | None) -> bool:
-    key = _profile_key(profile)
-    return key is None or key in config.ENGINEERING_PROFILES
+def _active_profile_config(
+    profile: str | object | None,
+    profile_config: ProfileConfig | None = None,
+) -> ProfileConfig:
+    if profile_config is not None:
+        return profile_config
+    return resolve_profile_config(profile)
 
 
 def _crop_limit_values(
     profile: str | object | None,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[float, float, float, float]:
     """Return max_aspect, min_height_ratio, min_width_ratio, min_area_ratio."""
-    if _uses_engineering_crop_limits(profile):
-        return (
-            config.ENGINEERING_MAX_CROP_ASPECT_RATIO,
-            config.ENGINEERING_MIN_CROP_HEIGHT_RATIO,
-            config.ENGINEERING_MIN_CROP_WIDTH_RATIO,
-            config.MIN_CROP_AREA_RATIO,
-        )
+    pcfg = _active_profile_config(profile, profile_config)
     return (
-        config.MAX_CROP_ASPECT_RATIO,
-        config.MIN_CROP_HEIGHT_RATIO,
-        config.MIN_CROP_WIDTH_RATIO,
-        config.MIN_CROP_AREA_RATIO,
+        pcfg.max_crop_aspect_ratio,
+        pcfg.min_crop_height_ratio,
+        pcfg.min_crop_width_ratio,
+        pcfg.min_crop_area_ratio,
     )
 
 
@@ -750,6 +757,8 @@ def line_art_density_in_bbox(
     image_bgr: np.ndarray,
     bbox_xyxy: tuple[int, int, int, int],
     text_boxes: list[TextBox] | None = None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> float:
     """Fraction of bbox pixels that are line-art ink (edges/thin strokes, not text)."""
     h, w = image_bgr.shape[:2]
@@ -758,7 +767,9 @@ def line_art_density_in_bbox(
     x1, y1 = min(w, x1), min(h, y1)
     if x1 <= x0 or y1 <= y0:
         return 0.0
-    mask = build_line_art_mask(image_bgr, text_boxes)
+    mask = build_line_art_mask(
+        image_bgr, text_boxes, profile_config=profile_config
+    )
     roi = mask[y0:y1, x0:x1]
     return float(np.count_nonzero(roi)) / max(roi.size, 1)
 
@@ -769,23 +780,27 @@ def is_valid_figure_crop(
     profile: str | object | None = None,
     *,
     line_art_density: float | None = None,
+    profile_config: ProfileConfig | None = None,
 ) -> bool:
     """Reject edge slivers, tiny fragments, and extreme aspect ratios."""
+    pcfg = _active_profile_config(profile, profile_config)
     ph, pw = page_shape
     x, y, bw, bh = box
     if bw <= 0 or bh <= 0:
         return False
 
-    max_aspect, min_h_ratio, min_w_ratio, min_area = _crop_limit_values(profile)
+    max_aspect, min_h_ratio, min_w_ratio, min_area = _crop_limit_values(
+        profile, profile_config=pcfg
+    )
     area_ratio = (bw * bh) / max(ph * pw, 1)
     aspect = bw / max(bh, 1)
     height_ratio = bh / max(ph, 1)
 
     if area_ratio < min_area:
         return False
-    if area_ratio > config.MAX_FIGURE_OUTPUT_AREA_RATIO:
+    if area_ratio > pcfg.max_figure_output_area_ratio:
         return False
-    if aspect < config.MIN_CROP_ASPECT_RATIO or aspect > max_aspect:
+    if aspect < pcfg.min_crop_aspect_ratio or aspect > max_aspect:
         return False
     if bw < pw * min_w_ratio:
         return False
@@ -795,7 +810,7 @@ def is_valid_figure_crop(
     # Wide shallow crops must contain enough line art (blocks empty dimension strips).
     if aspect > 4.0 and height_ratio < 0.22:
         density = line_art_density if line_art_density is not None else 0.0
-        if density < config.ENGINEERING_MIN_LINE_ART_DENSITY:
+        if density < pcfg.min_line_art_density:
             return False
     return True
 
@@ -984,14 +999,17 @@ def _detect_dense_text_block_mask(gray: np.ndarray) -> np.ndarray:
 def build_line_art_mask(
     image_bgr: np.ndarray,
     text_boxes: list[TextBox] | None = None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> np.ndarray:
     """Edges and thin strokes with OCR + dense text regions removed."""
+    pcfg = _active_profile_config(None, profile_config)
     h, w = image_bgr.shape[:2]
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(
         gray,
-        config.LINE_ART_CANNY_LOW,
-        config.LINE_ART_CANNY_HIGH,
+        pcfg.line_art_canny_low,
+        pcfg.line_art_canny_high,
     )
     thin = cv2.erode(
         (gray < config.CROP_INK_GRAY_MAX).astype(np.uint8) * 255,
@@ -1000,7 +1018,12 @@ def build_line_art_mask(
     )
     line_art = cv2.bitwise_or(edges, thin)
 
-    exclude = build_text_mask((h, w), text_boxes or [], include_layout_zones=False)
+    exclude = build_text_mask(
+        (h, w),
+        text_boxes or [],
+        include_layout_zones=False,
+        profile_config=pcfg,
+    )
     exclude = cv2.bitwise_or(exclude, _detect_dense_text_block_mask(gray))
     line_art[exclude > 0] = 0
 
@@ -1039,6 +1062,8 @@ def tighten_bbox_to_line_art(
     x2: int,
     y2: int,
     text_boxes: list[TextBox] | None = None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[int, int, int, int]:
     """
     Tighten crop to line-art ink: trim empty margins; expand vertically only
@@ -1048,37 +1073,42 @@ def tighten_bbox_to_line_art(
     if x2 <= x1 or y2 <= y1:
         return x1, y1, x2, y2
 
-    mask = build_line_art_mask(image_bgr, text_boxes)
+    pcfg = _active_profile_config(None, profile_config)
+    mask = build_line_art_mask(image_bgr, text_boxes, profile_config=pcfg)
     bw, bh = x2 - x1, y2 - y1
     aspect = bw / max(bh, 1)
     seed_area = bw * bh
     seed = (x1, y1, x2, y2)
-    max_area = int(h * w * config.MAX_FIGURE_OUTPUT_AREA_RATIO)
+    max_area = int(h * w * pcfg.max_figure_output_area_ratio)
 
     seed_mask = mask[y1:y2, x1:x2]
     if seed_mask.size == 0 or np.count_nonzero(seed_mask) < 24:
         return seed
 
-    # Wide shallow seed: allow vertical growth within search band.
-    if aspect > 3.0:
+    is_cad_wide = pcfg.crop_profile == CropProfile.CAD_WIDE
+    wide_aspect_thresh = 2.0 if is_cad_wide else 3.0
+
+    # Wide shallow seed: snap vertical bounds to line-art rows (fuselage, side views).
+    if aspect > wide_aspect_thresh:
         pad_y = max(
-            int(bh * config.LINE_ART_TIGHTEN_SEARCH_RATIO),
-            int(h * config.LINE_ART_TIGHTEN_WIDE_VERTICAL_SEARCH_RATIO),
+            int(bh * pcfg.line_art_tighten_search_ratio),
+            int(h * pcfg.line_art_tighten_wide_vertical_search_ratio),
         )
         sy1 = max(0, y1 - pad_y)
         sy2 = min(h, y2 + pad_y)
         row_sum = mask[sy1:sy2, x1:x2].sum(axis=1).astype(np.float32)
         if row_sum.max() > 4:
-            row_thresh = max(row_sum.max() * config.LINE_ART_ROW_COL_THRESH_FRAC, 4.0)
+            row_thresh = max(row_sum.max() * pcfg.line_art_row_col_thresh_frac, 4.0)
             rows = np.where(row_sum >= row_thresh)[0]
             if len(rows) >= 2:
                 y1 = sy1 + int(rows[0])
                 y2 = sy1 + int(rows[-1]) + 1
 
     # Shrink empty margins on all four sides.
-    strip_px = max(8, int(min(x2 - x1, y2 - y1) * 0.04))
-    edge_thresh = 0.006
-    for _ in range(24):
+    strip_px = max(8, int(min(x2 - x1, y2 - y1) * (0.05 if is_cad_wide else 0.04)))
+    edge_thresh = 0.005 if is_cad_wide else 0.006
+    min_seed_frac = 0.28 if is_cad_wide else 0.35
+    for _ in range(28 if is_cad_wide else 24):
         roi = mask[y1:y2, x1:x2]
         if roi.size == 0:
             break
@@ -1097,11 +1127,17 @@ def tighten_bbox_to_line_art(
             changed = True
         if not changed:
             break
-        if (x2 - x1) * (y2 - y1) < seed_area * 0.35:
+        if (x2 - x1) * (y2 - y1) < seed_area * min_seed_frac:
             break
 
-    margin_x = max(int((x2 - x1) * config.LINE_ART_TIGHTEN_MARGIN_RATIO), config.LINE_ART_TIGHTEN_MIN_MARGIN_PX)
-    margin_y = max(int((y2 - y1) * config.LINE_ART_TIGHTEN_MARGIN_RATIO), config.LINE_ART_TIGHTEN_MIN_MARGIN_PX)
+    margin_x = max(
+        int((x2 - x1) * pcfg.line_art_tighten_margin_ratio),
+        pcfg.line_art_tighten_min_margin_px,
+    )
+    margin_y = max(
+        int((y2 - y1) * pcfg.line_art_tighten_margin_ratio),
+        pcfg.line_art_tighten_min_margin_px,
+    )
     nx1 = max(0, x1 - margin_x)
     ny1 = max(0, y1 - margin_y)
     nx2 = min(w, x2 + margin_x)
@@ -1119,7 +1155,7 @@ def tighten_bbox_to_line_art(
         return seed
 
     tight_area = (tightened[2] - tightened[0]) * (tightened[3] - tightened[1])
-    if tight_area < seed_area * config.TIGHTEN_MIN_RETAINED_AREA_FRAC:
+    if tight_area < seed_area * pcfg.tighten_min_retained_area_frac:
         return seed
     return tightened
 
@@ -1153,23 +1189,26 @@ def shrink_bbox_from_text_overlap(
     x2: int,
     y2: int,
     text_boxes: list[TextBox] | None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[int, int, int, int]:
     """Trim crop edges that contain OCR text until overlap is below target."""
     if not text_boxes:
         return x1, y1, x2, y2
 
+    pcfg = _active_profile_config(None, profile_config)
     h, w = image_bgr.shape[:2]
     orig_area = max((x2 - x1) * (y2 - y1), 1)
     bbox = (x1, y1, x2, y2)
 
-    for _ in range(config.TEXT_SHRINK_MAX_ITERATIONS):
+    for _ in range(pcfg.text_shrink_max_iterations):
         overlap = estimate_text_coverage_in_bbox(bbox, text_boxes)
-        if overlap <= config.TEXT_SHRINK_TARGET_OVERLAP:
+        if overlap <= pcfg.text_shrink_target_overlap:
             break
 
         bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        step_x = max(2, int(bw * config.TEXT_SHRINK_STEP_RATIO))
-        step_y = max(2, int(bh * config.TEXT_SHRINK_STEP_RATIO))
+        step_x = max(2, int(bw * pcfg.text_shrink_step_ratio))
+        step_y = max(2, int(bh * pcfg.text_shrink_step_ratio))
         strip_px = max(12, int(min(bw, bh) * 0.06))
 
         edges = ("top", "bottom", "left", "right")
@@ -1191,9 +1230,12 @@ def shrink_bbox_from_text_overlap(
             bx1 = max(bx0 + 10, bx1 - step_x)
 
         new_area = max((bx1 - bx0) * (by1 - by0), 1)
-        if new_area < orig_area * config.TEXT_SHRINK_MIN_REMAINING_RATIO:
+        if new_area < orig_area * pcfg.text_shrink_min_remaining_ratio:
             break
-        if line_art_density_in_bbox(image_bgr, (bx0, by0, bx1, by1), text_boxes) < config.ENGINEERING_MIN_LINE_ART_DENSITY * 0.5:
+        if (
+            line_art_density_in_bbox(image_bgr, (bx0, by0, bx1, by1), text_boxes)
+            < pcfg.min_line_art_density * 0.5
+        ):
             break
         bbox = (bx0, by0, bx1, by1)
 
@@ -1208,11 +1250,16 @@ def refine_figure_crop_bounds(
     y2: int,
     text_boxes: list[TextBox] | None = None,
     profile: str | object | None = None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[int, int, int, int]:
     """Line-art tighten then post-crop text shrink."""
-    x1, y1, x2, y2 = tighten_bbox_to_line_art(image_bgr, x1, y1, x2, y2, text_boxes)
+    pcfg = _active_profile_config(profile, profile_config)
+    x1, y1, x2, y2 = tighten_bbox_to_line_art(
+        image_bgr, x1, y1, x2, y2, text_boxes, profile_config=pcfg
+    )
     x1, y1, x2, y2 = shrink_bbox_from_text_overlap(
-        image_bgr, x1, y1, x2, y2, text_boxes
+        image_bgr, x1, y1, x2, y2, text_boxes, profile_config=pcfg
     )
     return x1, y1, x2, y2
 
@@ -1225,16 +1272,22 @@ def _validate_and_crop(
     y2: int,
     text_boxes: list[TextBox] | None,
     profile: str | object | None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    pcfg = _active_profile_config(profile, profile_config)
     if x2 <= x1 or y2 <= y1:
         return None
     final_box = (x1, y1, x2 - x1, y2 - y1)
-    density = line_art_density_in_bbox(image_bgr, (x1, y1, x2, y2), text_boxes)
+    density = line_art_density_in_bbox(
+        image_bgr, (x1, y1, x2, y2), text_boxes, profile_config=pcfg
+    )
     if not is_valid_figure_crop(
         final_box,
         image_bgr.shape[:2],
         profile,
         line_art_density=density,
+        profile_config=pcfg,
     ):
         return None
     return image_bgr[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
@@ -1268,29 +1321,45 @@ def prepare_primary_crop(
     y2: int,
     text_boxes: list[TextBox] | None,
     profile: str | object | None = None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
     """
     Refine bbox, validate with profile limits, return crop and xyxy bbox.
     """
+    pcfg = _active_profile_config(profile, profile_config)
     if x2 <= x1 or y2 <= y1:
         return None
 
     seed = (x1, y1, x2, y2)
     rx1, ry1, rx2, ry2 = refine_figure_crop_bounds(
-        image_bgr, x1, y1, x2, y2, text_boxes, profile=profile
+        image_bgr,
+        x1,
+        y1,
+        x2,
+        y2,
+        text_boxes,
+        profile=profile,
+        profile_config=pcfg,
     )
     result = _validate_and_crop(
-        image_bgr, rx1, ry1, rx2, ry2, text_boxes, profile
+        image_bgr, rx1, ry1, rx2, ry2, text_boxes, profile, profile_config=pcfg
     )
     if result is not None:
         return result
 
     # Fallback: text-shrink seed only (avoid failed tighten on photo-heavy PDFs).
     sx1, sy1, sx2, sy2 = shrink_bbox_from_text_overlap(
-        image_bgr, seed[0], seed[1], seed[2], seed[3], text_boxes
+        image_bgr,
+        seed[0],
+        seed[1],
+        seed[2],
+        seed[3],
+        text_boxes,
+        profile_config=pcfg,
     )
     return _validate_and_crop(
-        image_bgr, sx1, sy1, sx2, sy2, text_boxes, profile
+        image_bgr, sx1, sy1, sx2, sy2, text_boxes, profile, profile_config=pcfg
     )
 
 

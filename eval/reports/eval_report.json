@@ -1,0 +1,141 @@
+{
+  "manifest_path": "/home/dell/IMAGE_EXTRACTION/eval/manifest.json",
+  "total_samples": 6,
+  "evaluated": 6,
+  "skipped_missing": 0,
+  "passed": 2,
+  "failed": 4,
+  "pass_rate": 0.3333,
+  "failure_counts": {
+    "profile_mismatch": 2,
+    "low_confidence": 2
+  },
+  "pages": [
+    {
+      "sample_id": "landing_gear_pdf_p0",
+      "source_path": "/home/dell/images/04_landing_gear_assembly.pdf",
+      "page_index": 0,
+      "passed": false,
+      "failure_category": "profile_mismatch",
+      "iou": null,
+      "predicted_bbox": [
+        126,
+        10,
+        2246,
+        1700
+      ],
+      "predicted_area_ratio": 0.5026,
+      "predicted_text_overlap": 0.0344,
+      "predicted_confidence": 0.7329,
+      "predicted_method": "morphology",
+      "page_profile": "simple_image",
+      "crop_profile": "simple_raster",
+      "details": "Expected crop_profile=blueprint_large, got simple_raster"
+    },
+    {
+      "sample_id": "avionics_bay_pdf_p0",
+      "source_path": "/home/dell/images/05_avionics_bay_layout.pdf",
+      "page_index": 0,
+      "passed": true,
+      "failure_category": "good",
+      "iou": null,
+      "predicted_bbox": [
+        0,
+        0,
+        2324,
+        1638
+      ],
+      "predicted_area_ratio": 0.534,
+      "predicted_text_overlap": 0.091,
+      "predicted_confidence": 0.6425,
+      "predicted_method": "morphology",
+      "page_profile": "simple_image",
+      "crop_profile": "cad_wide",
+      "details": "All checks passed"
+    },
+    {
+      "sample_id": "gasket_png_p0",
+      "source_path": "/home/dell/images/drawing_04_gasket.png",
+      "page_index": 0,
+      "passed": true,
+      "failure_category": "good",
+      "iou": null,
+      "predicted_bbox": [
+        812,
+        400,
+        1667,
+        1252
+      ],
+      "predicted_area_ratio": 0.1675,
+      "predicted_text_overlap": 0.0694,
+      "predicted_confidence": 0.6037,
+      "predicted_method": "morphology",
+      "page_profile": "engineering_sheet",
+      "crop_profile": "cad_wide",
+      "details": "All checks passed"
+    },
+    {
+      "sample_id": "wing_rib_png_p0",
+      "source_path": "/home/dell/images/dwg_wing_rib_assembly.png",
+      "page_index": 0,
+      "passed": false,
+      "failure_category": "low_confidence",
+      "iou": null,
+      "predicted_bbox": [
+        31,
+        240,
+        1921,
+        906
+      ],
+      "predicted_area_ratio": 0.6044,
+      "predicted_text_overlap": 0.0665,
+      "predicted_confidence": 0.191,
+      "predicted_method": "photo",
+      "page_profile": "simple_image",
+      "crop_profile": "cad_wide",
+      "details": "Confidence 0.191 below 0.350"
+    },
+    {
+      "sample_id": "scanned_cad_pdf_p0",
+      "source_path": "/home/dell/images/scanned_cad_drawing.pdf",
+      "page_index": 0,
+      "passed": false,
+      "failure_category": "low_confidence",
+      "iou": null,
+      "predicted_bbox": [
+        29,
+        802,
+        4244,
+        2498
+      ],
+      "predicted_area_ratio": 0.4108,
+      "predicted_text_overlap": 0.0319,
+      "predicted_confidence": 0.2603,
+      "predicted_method": "photo",
+      "page_profile": "engineering_sheet",
+      "crop_profile": "blueprint_large",
+      "details": "Confidence 0.260 below 0.350"
+    },
+    {
+      "sample_id": "fuselage_png_p0",
+      "source_path": "/home/dell/images/ChatGPT Image May 27, 2026, 12_29_42 PM.png",
+      "page_index": 0,
+      "passed": false,
+      "failure_category": "profile_mismatch",
+      "iou": null,
+      "predicted_bbox": [
+        0,
+        174,
+        1190,
+        632
+      ],
+      "predicted_area_ratio": 0.3466,
+      "predicted_text_overlap": 0.1726,
+      "predicted_confidence": 0.5551,
+      "predicted_method": "morphology",
+      "page_profile": "simple_image",
+      "crop_profile": "simple_raster",
+      "details": "Expected crop_profile=cad_wide, got simple_raster"
+    }
+  ]
+}

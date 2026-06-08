@@ -45,6 +45,7 @@ class PageExtraction:
     figure_type: str | None = None
     figure_confidence: float | None = None
     page_profile: str | None = None
+    crop_profile: str | None = None
     morphology_component_score: float | None = None
     morphology_gate_score: float | None = None
     morphology_quality_passed: bool | None = None
@@ -90,6 +91,7 @@ def _figure_to_dict(figure: ExtractedFigure) -> dict:
         "area_ratio": figure.area_ratio,
         "confidence": figure.confidence,
         "page_profile": figure.page_profile,
+        "crop_profile": figure.crop_profile,
         "text_overlap": figure.text_overlap,
         "completeness": figure.completeness,
         "is_primary": figure.is_primary,
@@ -120,6 +122,7 @@ def _write_json_files(
                 "figure_type": p.figure_type,
                 "figure_confidence": p.figure_confidence,
                 "page_profile": p.page_profile,
+                "crop_profile": p.crop_profile,
                 "rapid_ocr_accuracy": p.rapid_ocr_accuracy,
                 "pipeline_ocr_accuracy": p.pipeline_ocr_accuracy,
                 "keywords": p.keywords,
@@ -383,6 +386,7 @@ class ExtractionPipeline:
                     figure_type=fig.figure_type if fig else None,
                     figure_confidence=fig.confidence if fig else None,
                     page_profile=fig.page_profile if fig else None,
+                    crop_profile=fig.crop_profile if fig else None,
                     morphology_component_score=p.morphology_component_score,
                     morphology_gate_score=p.morphology_gate_score,
                     morphology_quality_passed=p.morphology_quality_passed,

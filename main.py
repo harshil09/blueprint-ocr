@@ -63,6 +63,7 @@ async def extract_file(file: UploadFile = File(...)) -> dict:
                 "figure_type": p.figure_type,
                 "figure_confidence": p.figure_confidence,
                 "page_profile": p.page_profile,
+                "crop_profile": p.crop_profile,
                 "keyword_count": len(p.keyword_list),
                 "rapid_ocr_accuracy": p.rapid_ocr_accuracy,
                 "pipeline_ocr_accuracy": p.pipeline_ocr_accuracy,
