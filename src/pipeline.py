@@ -10,8 +10,12 @@ from tqdm import tqdm
 
 from src import config
 from src.document_loader import PageImage, load_document
-from src.extract_figure import extract_engineering_figure_with_metadata
-from src.image_extractor import ExtractedFigure, extract_all_figures
+from src.extract_figure import compute_engineering_figure_crop
+from src.image_extractor import (
+    ExtractedFigure,
+    MorphologyPageCandidate,
+    extract_primary_figures,
+)
 from src.keyword_extractor import extract_keywords, keywords_as_strings
 from src.logger import get_logger
 from src.ocr.accuracy import (
@@ -36,6 +40,11 @@ class PageExtraction:
     keywords: list[dict]
     keyword_list: list[str]
     engineering_figure_path: str | None = None
+    primary_figure_path: str | None = None
+    figure_method: str | None = None
+    figure_type: str | None = None
+    figure_confidence: float | None = None
+    page_profile: str | None = None
     morphology_component_score: float | None = None
     morphology_gate_score: float | None = None
     morphology_quality_passed: bool | None = None
@@ -75,9 +84,15 @@ def _figure_to_dict(figure: ExtractedFigure) -> dict:
         "page_index": figure.page_index,
         "figure_index": figure.figure_index,
         "method": figure.method,
+        "figure_type": figure.figure_type,
         "path": str(figure.image_path),
         "bbox": figure.bbox,
         "area_ratio": figure.area_ratio,
+        "confidence": figure.confidence,
+        "page_profile": figure.page_profile,
+        "text_overlap": figure.text_overlap,
+        "completeness": figure.completeness,
+        "is_primary": figure.is_primary,
     }
 
 
@@ -100,6 +115,11 @@ def _write_json_files(
                 "morphology_component_score": p.morphology_component_score,
                 "morphology_gate_score": p.morphology_gate_score,
                 "morphology_quality_passed": p.morphology_quality_passed,
+                "primary_figure_path": p.primary_figure_path,
+                "figure_method": p.figure_method,
+                "figure_type": p.figure_type,
+                "figure_confidence": p.figure_confidence,
+                "page_profile": p.page_profile,
                 "rapid_ocr_accuracy": p.rapid_ocr_accuracy,
                 "pipeline_ocr_accuracy": p.pipeline_ocr_accuracy,
                 "keywords": p.keywords,
@@ -181,10 +201,11 @@ class ExtractionPipeline:
         log.info("Output directory: %s", doc_out)
 
         pages = load_document(path)
+        page_count = len(pages)
         ocr_results: list[OcrPageResult] = []
         page_results: list[PageExtraction] = []
         all_page_text: list[str] = []
-        morphology_paths: dict[int, Path] = {}
+        morphology_candidates: dict[int, MorphologyPageCandidate] = {}
 
         reference_pages: list[str] = []
         reference_source = "none"
@@ -277,28 +298,29 @@ class ExtractionPipeline:
                                 pipeline_metrics.word_accuracy * 100,
                             )
 
-            figure_path = (
-                doc_out
-                / f"engineering_figure_{page.page_index}.{config.OUTPUT_IMAGE_FORMAT}"
-            )
-            eng_path, selection = extract_engineering_figure_with_metadata(
+            morph_result = compute_engineering_figure_crop(
                 page.image,
-                figure_path,
                 text_boxes=ocr.boxes,
                 apply_text_mask=True,
             )
-            if eng_path is not None:
-                morphology_paths[page.page_index] = eng_path
+            selection = None
+            if morph_result is not None:
+                crop, bbox, selection = morph_result
+                morphology_candidates[page.page_index] = MorphologyPageCandidate(
+                    crop=crop,
+                    bbox=bbox,
+                    selection=selection,
+                )
                 log.info(
-                    "Engineering figure extracted: %s (quality_passed=%s "
+                    "Morphology candidate page %d (quality_passed=%s "
                     "component_score=%.3f gate_score=%.3f)",
-                    eng_path.name,
-                    selection.quality.passed if selection else None,
-                    selection.component_score if selection else 0.0,
-                    selection.gate_score if selection else 0.0,
+                    page.page_index,
+                    selection.quality.passed,
+                    selection.component_score,
+                    selection.gate_score,
                 )
             else:
-                log.info("No engineering figure from morphology on page %d", page.page_index)
+                log.info("No morphology candidate on page %d", page.page_index)
 
             keywords = extract_keywords(ocr.full_text)
             log.info("Keywords extracted: %d on page %d", len(keywords), page.page_index)
@@ -317,7 +339,8 @@ class ExtractionPipeline:
                     ocr_mean_confidence=round(mean_page_confidence(ocr), 4),
                     keywords=keywords,
                     keyword_list=[k["keyword"] for k in keywords],
-                    engineering_figure_path=str(eng_path) if eng_path else None,
+                    engineering_figure_path=None,
+                    primary_figure_path=None,
                     morphology_component_score=comp_score,
                     morphology_gate_score=gate_score,
                     morphology_quality_passed=quality_ok,
@@ -329,14 +352,45 @@ class ExtractionPipeline:
         full_text = "\n\n".join(all_page_text)
         all_keywords = keywords_as_strings(full_text)
 
-        log.info("Running figure extraction (embedded / photo / layout)")
-        figures = extract_all_figures(
+        log.info(
+            "Running primary figure fusion (%d page(s), one output per page)",
+            page_count,
+        )
+        figures = extract_primary_figures(
             path,
             pages,
             ocr_results,
             doc_out,
-            morphology_by_page=morphology_paths,
+            morphology_by_page=morphology_candidates,
         )
+
+        figures_by_page = {f.page_index: f for f in figures}
+        updated_pages: list[PageExtraction] = []
+        for p in page_results:
+            fig = figures_by_page.get(p.page_index)
+            primary_path = str(fig.image_path) if fig else None
+            updated_pages.append(
+                PageExtraction(
+                    page_index=p.page_index,
+                    ocr_text=p.ocr_text,
+                    ocr_engine=p.ocr_engine,
+                    ocr_mean_confidence=p.ocr_mean_confidence,
+                    keywords=p.keywords,
+                    keyword_list=p.keyword_list,
+                    engineering_figure_path=primary_path,
+                    primary_figure_path=primary_path,
+                    figure_method=fig.method if fig else None,
+                    figure_type=fig.figure_type if fig else None,
+                    figure_confidence=fig.confidence if fig else None,
+                    page_profile=fig.page_profile if fig else None,
+                    morphology_component_score=p.morphology_component_score,
+                    morphology_gate_score=p.morphology_gate_score,
+                    morphology_quality_passed=p.morphology_quality_passed,
+                    rapid_ocr_accuracy=p.rapid_ocr_accuracy,
+                    pipeline_ocr_accuracy=p.pipeline_ocr_accuracy,
+                )
+            )
+        page_results = updated_pages
 
         engine_counts: dict[str, int] = {}
         confidences: list[float] = []

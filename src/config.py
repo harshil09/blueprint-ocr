@@ -55,7 +55,7 @@ NOTES_BLOCK_WIDTH_RATIO = 0.42
 NOTES_BLOCK_HEIGHT_RATIO = 0.28
 TITLE_BLOCK_WIDTH_RATIO = 0.48
 # Full-width bottom strip (notes, LOFT, title block) excluded from figure detection.
-BOTTOM_ANNOTATION_BAND_RATIO = 0.45
+BOTTOM_ANNOTATION_BAND_RATIO = 0.42
 # Final crop cannot extend below this fraction of page height.
 # Exclude right-edge sidebar text / scan artifacts from drawing detection.
 PAGE_MARGIN_RIGHT_RATIO = 0.08
@@ -158,4 +158,72 @@ REGION_OCR_MIN_SIDE_PX = 1200
 REGION_OCR_GRID_ROWS = 2
 REGION_OCR_GRID_COLS = 2
 REGION_OCR_OVERLAP_RATIO = 0.08
+
+# ---------------------------------------------------------------------------
+# Primary figure fusion (one ranked output per page)
+# ---------------------------------------------------------------------------
+# Minimum composite score to emit a primary figure for a page.
+PRIMARY_FIGURE_MIN_CONFIDENCE = 0.35
+# Reject winners with more than this OCR text overlap inside the crop.
+PRIMARY_FIGURE_MAX_TEXT_OVERLAP = 0.28
+# Ring-ink completeness: low score means content likely clipped at crop edge.
+PRIMARY_FIGURE_MIN_COMPLETENESS = 0.22
+COMPLETENESS_RING_EXPAND_RATIO = 0.04
+COMPLETENESS_RING_INK_THRESHOLD = 0.008
+# Method priors when page profile is engineering line art.
+METHOD_PRIOR_ENGINEERING: dict[str, float] = {
+    "morphology": 1.0,
+    "projection": 0.95,
+    "embedded": 0.85,
+    "layout": 0.72,
+    "photo": 0.55,
+}
+# Method priors when page profile favors photos / simple raster images.
+METHOD_PRIOR_PHOTO: dict[str, float] = {
+    "photo": 1.0,
+    "embedded": 0.9,
+    "layout": 0.78,
+    "morphology": 0.62,
+    "projection": 0.65,
+}
+# Text-heavy pages (high OCR coverage) skip figure extraction.
+PAGE_TEXT_HEAVY_COVERAGE_RATIO = 0.42
+# Edge density threshold reused for engineering sheet detection.
+ENGINEERING_EDGE_DENSITY_MIN = 0.02
+
+# ---------------------------------------------------------------------------
+# Profile-specific crop limits + line-art refinement
+# ---------------------------------------------------------------------------
+# Relaxed limits for wide side views (fuselage, wing profiles) on engineering pages.
+ENGINEERING_MAX_CROP_ASPECT_RATIO = 7.5
+ENGINEERING_MIN_CROP_HEIGHT_RATIO = 0.14
+ENGINEERING_MIN_CROP_WIDTH_RATIO = 0.28
+# Wide shallow boxes must exceed this line-art density to avoid sliver false positives.
+ENGINEERING_MIN_LINE_ART_DENSITY = 0.01
+ENGINEERING_PROFILES = frozenset({"engineering_sheet", "simple_image", "mixed"})
+
+# Line-art tightener (stroke/edge mask excluding text blobs).
+LINE_ART_CANNY_LOW = 30
+LINE_ART_CANNY_HIGH = 100
+LINE_ART_TIGHTEN_SEARCH_RATIO = 0.10
+LINE_ART_TIGHTEN_WIDE_VERTICAL_SEARCH_RATIO = 0.28
+LINE_ART_TIGHTEN_MARGIN_RATIO = 0.03
+LINE_ART_TIGHTEN_MIN_MARGIN_PX = 12
+LINE_ART_ROW_COL_THRESH_FRAC = 0.018
+DENSE_TEXT_BLOCK_MIN_AREA_RATIO = 0.0025
+DENSE_TEXT_BLOCK_MIN_FILL = 0.38
+
+# Post-crop text shrink (iteratively trim edges with OCR text overlap).
+TEXT_SHRINK_TARGET_OVERLAP = 0.10
+TEXT_SHRINK_STEP_RATIO = 0.025
+TEXT_SHRINK_MAX_ITERATIONS = 16
+TEXT_SHRINK_MIN_REMAINING_RATIO = 0.45
+
+# Embedded PDF images: skip full-page scans in favour of raster line-art crops.
+EMBEDDED_FUSION_MAX_AREA_RATIO = 0.14
+EMBEDDED_FUSION_MIN_PAGE_DIMENSION_RATIO = 0.42
+# Dense-text detector: cap block size so line-art regions are not fully masked.
+DENSE_TEXT_BLOCK_MAX_AREA_RATIO = 0.11
+# Line-art tighten: revert when shrink would discard too much of the seed bbox.
+TIGHTEN_MIN_RETAINED_AREA_FRAC = 0.52
 

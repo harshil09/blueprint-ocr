@@ -56,6 +56,11 @@ def _run_local_pipeline(uploaded_file) -> dict:
                 "ocr_engine": p.ocr_engine,
                 "ocr_mean_confidence": p.ocr_mean_confidence,
                 "engineering_figure_path": p.engineering_figure_path,
+                "primary_figure_path": p.primary_figure_path,
+                "figure_method": p.figure_method,
+                "figure_type": p.figure_type,
+                "figure_confidence": p.figure_confidence,
+                "page_profile": p.page_profile,
                 "keyword_count": len(p.keyword_list),
                 "rapid_ocr_accuracy": p.rapid_ocr_accuracy,
                 "pipeline_ocr_accuracy": p.pipeline_ocr_accuracy,
@@ -85,9 +90,17 @@ def _list_preview_images(output_dir: str) -> list[Path]:
     if not root.is_dir():
         return []
     paths: list[Path] = []
-    for pattern in ("engineering_figure_*.png", "images/*"):
-        paths.extend(sorted(root.glob(pattern)))
-    return [p for p in paths if p.suffix.lower() in IMAGE_SUFFIXES and p.is_file()]
+    primary = sorted(root.glob("images/primary_figure*"))
+    if primary:
+        return [p for p in primary if p.is_file()]
+    legacy = sorted(root.glob("engineering_figure_*.png"))
+    if legacy:
+        return [p for p in legacy if p.is_file()]
+    return [
+        p
+        for p in sorted(root.glob("images/*"))
+        if p.suffix.lower() in IMAGE_SUFFIXES and p.is_file()
+    ]
 
 
 def _render_results(data: dict) -> None:
@@ -96,8 +109,14 @@ def _render_results(data: dict) -> None:
     keywords = data.get("keywords") or []
     keyword_count = len(keywords)
     c1.metric("Keywords (count)", keyword_count)
-    c2.metric("Figures", data.get("figures_count", 0))
+    figures_count = data.get("figures_count", 0)
+    c2.metric("Primary figures", figures_count)
     c3.metric("Pages", len(data.get("pages") or []))
+    if figures_count == 0:
+        st.error(
+            "No figure was extracted for this document. "
+            "Check logs or try a clearer scan. Output is under the directory below."
+        )
     if config.MAX_KEYWORDS is not None and keyword_count == config.MAX_KEYWORDS:
         c1.caption(f"Capped at MAX_KEYWORDS={config.MAX_KEYWORDS}")
 
@@ -153,8 +172,10 @@ def _render_results(data: dict) -> None:
 
     figures = data.get("figures")
     if figures:
-        st.subheader("Extracted figures")
+        st.subheader("Primary extracted figures")
         st.dataframe(figures, use_container_width=True, hide_index=True)
+    elif pages:
+        st.caption("Per-page primary figure paths are in the table above (`primary_figure_path`).")
 
     output_dir = data.get("output_dir")
     if output_dir:

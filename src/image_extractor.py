@@ -1,6 +1,6 @@
 """
 Figure extraction: layout figures, manufacturing photos, embedded PDF images,
-and region-grid helpers for large-format OCR.
+and primary-figure fusion (one ranked output per page).
 """
 
 from __future__ import annotations
@@ -14,14 +14,27 @@ import pymupdf as fitz
 
 from src import config
 from src.extract_figure import (
+    FigureSelectionResult,
     estimate_text_coverage_in_bbox,
     finalize_crop_bounds,
     find_main_drawing_bbox_via_projection,
     is_valid_figure_crop,
+    line_art_density_in_bbox,
     masked_non_text_edges,
+    prepare_primary_crop,
+    _pad_detection_bbox_xyxy,
+)
+from src.figure_fusion import (
+    FigureCandidate,
+    FigureType,
+    PageProfile,
+    build_candidate_from_crop,
+    classify_page,
+    crop_completeness_score,
+    select_primary_candidate,
 )
 from src.logger import get_logger
-from src.ocr.ocr_engine import TextBox
+from src.ocr.ocr_engine import OcrPageResult, TextBox
 from src.utils import bbox_iou, save_bgr
 
 log = get_logger(__name__)
@@ -33,14 +46,67 @@ class ExtractedFigure:
     page_index: int
     figure_index: int
     image_path: Path
-    method: str  # embedded | layout | photo | morphology
+    method: str
     bbox: tuple[int, int, int, int] | None
     area_ratio: float
+    figure_type: str = "line_art"
+    confidence: float = 0.0
+    page_profile: str = ""
+    text_overlap: float = 0.0
+    completeness: float = 0.0
+    is_primary: bool = True
+
+
+@dataclass(frozen=True)
+class MorphologyPageCandidate:
+    crop: np.ndarray
+    bbox: tuple[int, int, int, int]
+    selection: FigureSelectionResult
+
+
+# ---------------------------------------------------------------------------
+# Output paths
+# ---------------------------------------------------------------------------
+
+
+def primary_figure_path(
+    output_dir: Path,
+    page_index: int,
+    page_count: int,
+    *,
+    source_stem: str | None = None,
+) -> Path:
+    """One file per page; single-page documents use a stable name."""
+    img_dir = output_dir / "images"
+    ext = config.OUTPUT_IMAGE_FORMAT
+    if page_count == 1:
+        return img_dir / f"primary_figure.{ext}"
+    return img_dir / f"primary_figure_p{page_index:03d}.{ext}"
 
 
 # ---------------------------------------------------------------------------
 # Embedded PDF images
 # ---------------------------------------------------------------------------
+
+
+def _skip_embedded_for_fusion(
+    img_width: int,
+    img_height: int,
+    page_width: int,
+    page_height: int,
+    area_ratio: float,
+) -> bool:
+    """Omit full-page embedded rasters so raster line-art crops are preferred."""
+    if area_ratio > config.EMBEDDED_FUSION_MAX_AREA_RATIO:
+        return True
+    if page_width > 0 and page_height > 0:
+        dim_ratio = config.EMBEDDED_FUSION_MIN_PAGE_DIMENSION_RATIO
+        if (
+            img_width >= page_width * dim_ratio
+            or img_height >= page_height * dim_ratio
+        ) and area_ratio > 0.07:
+            return True
+    return False
 
 
 def _is_full_page_embedded(
@@ -58,22 +124,21 @@ def _is_full_page_embedded(
     return (img_width * img_height) >= page_area * 0.35
 
 
-def extract_embedded_pdf_images(
+def _embedded_candidates_by_page(
     pdf_path: Path,
-    output_dir: Path,
-    page_sizes: list[tuple[int, int]] | None = None,
-    min_bytes: int | None = None,
-) -> list[ExtractedFigure]:
-    threshold = min_bytes or config.MIN_EMBEDDED_IMAGE_BYTES
+    page_sizes: list[tuple[int, int]],
+) -> dict[int, list[FigureCandidate]]:
+    threshold = config.MIN_EMBEDDED_IMAGE_BYTES
     skip_full = config.SKIP_FULL_PAGE_EMBEDDED
-    figures: list[ExtractedFigure] = []
+    by_page: dict[int, list[FigureCandidate]] = {}
+
     doc = fitz.open(pdf_path)
     try:
-        fig_idx = 0
         for page_i, page in enumerate(doc):
             pw, ph = (0, 0)
-            if page_sizes and page_i < len(page_sizes):
+            if page_i < len(page_sizes):
                 pw, ph = page_sizes[page_i]
+            page_cands: list[FigureCandidate] = []
             for img_info in page.get_images(full=True):
                 xref = img_info[0]
                 base = doc.extract_image(xref)
@@ -82,86 +147,66 @@ def extract_embedded_pdf_images(
                 iw, ih = base.get("width", 0), base.get("height", 0)
                 if skip_full and _is_full_page_embedded(iw, ih, pw, ph):
                     continue
-                ext = base.get("ext", "png")
-                out_path = (
-                    output_dir / f"{pdf_path.stem}_p{page_i:03d}_embedded_{fig_idx:03d}.{ext}"
-                )
-                out_path.write_bytes(base["image"])
-                figures.append(
-                    ExtractedFigure(
-                        source_path=pdf_path,
+                page_area = max(pw * ph, 1)
+                area_ratio = (iw * ih) / page_area if pw and ph else 0.3
+                if _skip_embedded_for_fusion(iw, ih, pw, ph, area_ratio):
+                    log.debug(
+                        "Skipping embedded scan for fusion page %d (%dx%d, %.1f%% of page)",
+                        page_i,
+                        iw,
+                        ih,
+                        100 * area_ratio,
+                    )
+                    continue
+                page_cands.append(
+                    FigureCandidate(
                         page_index=page_i,
-                        figure_index=fig_idx,
-                        image_path=out_path,
                         method="embedded",
+                        figure_type=FigureType.EMBEDDED,
                         bbox=None,
-                        area_ratio=0.0,
+                        area_ratio=area_ratio,
+                        gate_score=0.72,
+                        text_overlap=0.0,
+                        completeness=1.0,
+                        embedded_bytes=base["image"],
+                        embedded_ext=base.get("ext", "png"),
+                        quality_passed=True,
                     )
                 )
-                fig_idx += 1
+            if page_cands:
+                by_page[page_i] = page_cands
     finally:
         doc.close()
-    if figures:
-        log.info("Embedded PDF images: extracted %d figure(s)", len(figures))
-    else:
-        log.debug("Embedded PDF images: none found (or skipped full-page scans)")
-    return figures
+    return by_page
 
 
 # ---------------------------------------------------------------------------
-# Layout / photo heuristics
+# Layout / photo / projection heuristics
 # ---------------------------------------------------------------------------
 
 
 def _is_valid_photo_bbox(
     bbox: tuple[int, int, int, int],
     page_shape: tuple[int, int],
+    profile: PageProfile | None = None,
+    *,
+    image_bgr: np.ndarray | None = None,
+    text_boxes: list[TextBox] | None = None,
 ) -> bool:
-    """Reject manufacturing-photo false positives (edge slivers, tiny strips)."""
-    ph, pw = page_shape
     x0, y0, x1, y1 = bbox
     bw, bh = x1 - x0, y1 - y0
-    return is_valid_figure_crop((x0, y0, bw, bh), page_shape)
-
-
-def extract_projection_figure(
-    source_path: Path,
-    page_index: int,
-    image_bgr: np.ndarray,
-    text_boxes: list[TextBox],
-    output_dir: Path,
-) -> list[ExtractedFigure]:
-    """Edge-projection fallback when morphology did not produce a figure."""
-    box = find_main_drawing_bbox_via_projection(image_bgr, text_boxes)
-    if box is None or not is_valid_figure_crop(box, image_bgr.shape[:2]):
-        return []
-
-    x, y, bw, bh = box
-    x1, y1, x2, y2 = finalize_crop_bounds(
-        image_bgr, x, y, x + bw, y + bh, text_boxes
+    density = None
+    if image_bgr is not None:
+        density = line_art_density_in_bbox(image_bgr, bbox, text_boxes)
+    return is_valid_figure_crop(
+        (x0, y0, bw, bh),
+        page_shape,
+        profile,
+        line_art_density=density,
     )
-    crop = image_bgr[y1:y2, x1:x2]
-    out_path = (
-        output_dir
-        / f"{source_path.stem}_p{page_index:03d}_projection.{config.OUTPUT_IMAGE_FORMAT}"
-    )
-    save_bgr(out_path, crop)
-    return [
-        ExtractedFigure(
-            source_path=source_path,
-            page_index=page_index,
-            figure_index=0,
-            image_path=out_path,
-            method="projection",
-            bbox=(x1, y1, x2, y2),
-            area_ratio=((x2 - x1) * (y2 - y1))
-            / (image_bgr.shape[0] * image_bgr.shape[1]),
-        )
-    ]
 
 
 def _is_engineering_line_drawing(image_bgr: np.ndarray) -> bool:
-    """Low-saturation pages with dense line work (CAD / scanned drawings)."""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     mean_sat = float(hsv[:, :, 1].mean())
     if mean_sat > config.PHOTO_SATURATION_MAX + 15:
@@ -169,7 +214,7 @@ def _is_engineering_line_drawing(image_bgr: np.ndarray) -> bool:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     edge_density = float(np.count_nonzero(edges) / max(edges.size, 1))
-    return edge_density >= 0.02
+    return edge_density >= config.ENGINEERING_EDGE_DENSITY_MIN
 
 
 def _find_layout_figures(
@@ -343,83 +388,293 @@ def _find_manufacturing_photo_bbox(
     return bbox, tight_ratio
 
 
-def extract_manufacturing_photo(
-    source_path: Path,
-    page_index: int,
-    image_bgr: np.ndarray,
-    output_dir: Path,
-    text_boxes: list[TextBox] | None = None,
-) -> list[ExtractedFigure]:
-    found = _find_manufacturing_photo_bbox(image_bgr)
-    if not found:
-        return []
-    bbox, area_ratio = found
-    if not _is_valid_photo_bbox(bbox, image_bgr.shape[:2]):
-        log.debug("Manufacturing photo bbox rejected (invalid crop geometry)")
-        return []
-    x0, y0, x1, y1 = bbox
-    x0, y0, x1, y1 = finalize_crop_bounds(image_bgr, x0, y0, x1, y1, text_boxes)
-    crop = image_bgr[y0:y1, x0:x1]
-    out_path = (
-        output_dir
-        / f"{source_path.stem}_p{page_index:03d}_manufacturing_photo.{config.OUTPUT_IMAGE_FORMAT}"
-    )
-    save_bgr(out_path, crop)
-    return [
-        ExtractedFigure(
-            source_path=source_path,
-            page_index=page_index,
-            figure_index=0,
-            image_path=out_path,
-            method="photo",
-            bbox=bbox,
-            area_ratio=area_ratio,
-        )
-    ]
-
-
-def extract_layout_figures(
-    source_path: Path,
+def _collect_projection_candidate(
     page_index: int,
     image_bgr: np.ndarray,
     text_boxes: list[TextBox],
+    profile: PageProfile,
+) -> FigureCandidate | None:
+    box = find_main_drawing_bbox_via_projection(image_bgr, text_boxes)
+    if box is None:
+        return None
+
+    x1, y1, x2, y2 = _pad_detection_bbox_xyxy(box, image_bgr.shape[:2])
+    prepared = prepare_primary_crop(
+        image_bgr, x1, y1, x2, y2, text_boxes, profile=profile
+    )
+    if prepared is None:
+        return None
+
+    crop, bbox_xyxy = prepared
+    return build_candidate_from_crop(
+        page_index,
+        "projection",
+        FigureType.LINE_ART,
+        image_bgr,
+        crop,
+        bbox_xyxy,
+        text_boxes,
+        gate_score=0.58,
+        quality_passed=True,
+    )
+
+
+def _collect_photo_candidate(
+    page_index: int,
+    image_bgr: np.ndarray,
+    text_boxes: list[TextBox],
+    profile: PageProfile,
+) -> FigureCandidate | None:
+    if profile == PageProfile.ENGINEERING_SHEET and _is_engineering_line_drawing(image_bgr):
+        return None
+
+    found = _find_manufacturing_photo_bbox(image_bgr)
+    if not found:
+        return None
+
+    bbox, _area_ratio = found
+    x0, y0, x1, y1 = bbox
+    x0, y0, x1, y1 = finalize_crop_bounds(image_bgr, x0, y0, x1, y1, text_boxes)
+    prepared = prepare_primary_crop(
+        image_bgr, x0, y0, x1, y1, text_boxes, profile=profile
+    )
+    if prepared is None:
+        return None
+
+    crop, final_bbox = prepared
+    cov = estimate_text_coverage_in_bbox(final_bbox, text_boxes)
+    if cov > config.PHOTO_MAX_TEXT_COVERAGE:
+        return None
+
+    return build_candidate_from_crop(
+        page_index,
+        "photo",
+        FigureType.PHOTO,
+        image_bgr,
+        crop,
+        final_bbox,
+        text_boxes,
+        gate_score=0.62,
+        quality_passed=True,
+    )
+
+
+def _collect_layout_candidate(
+    page_index: int,
+    image_bgr: np.ndarray,
+    text_boxes: list[TextBox],
+    profile: PageProfile,
+) -> FigureCandidate | None:
+    regions = _find_layout_figures(image_bgr, text_boxes, config.MIN_FIGURE_AREA_RATIO)
+    if not regions:
+        return None
+
+    bbox, _ratio = regions[0]
+    x0, y0, x1, y1 = bbox
+    x0, y0, x1, y1 = finalize_crop_bounds(image_bgr, x0, y0, x1, y1, text_boxes)
+    prepared = prepare_primary_crop(
+        image_bgr, x0, y0, x1, y1, text_boxes, profile=profile
+    )
+    if prepared is None:
+        return None
+
+    crop, final_bbox = prepared
+    return build_candidate_from_crop(
+        page_index,
+        "layout",
+        FigureType.LINE_ART,
+        image_bgr,
+        crop,
+        final_bbox,
+        text_boxes,
+        gate_score=0.5,
+        quality_passed=False,
+    )
+
+
+def _collect_morphology_candidate(
+    page_index: int,
+    image_bgr: np.ndarray,
+    text_boxes: list[TextBox],
+    morph: MorphologyPageCandidate | None,
+    profile: PageProfile,
+) -> FigureCandidate | None:
+    if morph is None:
+        return None
+
+    x1, y1, x2, y2 = morph.bbox
+    page_area = image_bgr.shape[0] * image_bgr.shape[1]
+    morph_area = (x2 - x1) * (y2 - y1) / max(page_area, 1)
+    if morph_area > config.MAX_FIGURE_OUTPUT_AREA_RATIO * 0.88:
+        log.debug(
+            "Morphology area %.1f%% too large on page %d — deferring to other extractors",
+            100 * morph_area,
+            page_index,
+        )
+        return None
+
+    prepared = prepare_primary_crop(
+        image_bgr, x1, y1, x2, y2, text_boxes, profile=profile
+    )
+    if prepared is None:
+        return None
+
+    crop, bbox_xyxy = prepared
+    sel = morph.selection
+    return build_candidate_from_crop(
+        page_index,
+        "morphology",
+        FigureType.LINE_ART,
+        image_bgr,
+        crop,
+        bbox_xyxy,
+        text_boxes,
+        gate_score=sel.gate_score,
+        component_score=sel.component_score,
+        quality_passed=sel.quality.passed,
+    )
+
+
+def _collect_page_candidates(
+    page_index: int,
+    image_bgr: np.ndarray,
+    ocr: OcrPageResult,
+    profile: PageProfile,
+    morph: MorphologyPageCandidate | None,
+    embedded: list[FigureCandidate],
+) -> list[FigureCandidate]:
+    text_boxes = ocr.boxes
+    candidates: list[FigureCandidate] = []
+
+    morph_cand = _collect_morphology_candidate(
+        page_index, image_bgr, text_boxes, morph, profile
+    )
+    if morph_cand is not None:
+        candidates.append(morph_cand)
+
+    proj = _collect_projection_candidate(page_index, image_bgr, text_boxes, profile)
+    if proj is not None:
+        candidates.append(proj)
+
+    photo = _collect_photo_candidate(page_index, image_bgr, text_boxes, profile)
+    if photo is not None:
+        candidates.append(photo)
+
+    layout = _collect_layout_candidate(page_index, image_bgr, text_boxes, profile)
+    if layout is not None:
+        candidates.append(layout)
+
+    candidates.extend(embedded)
+    return candidates
+
+
+def _save_primary_candidate(
+    source_path: Path,
+    candidate: FigureCandidate,
+    out_path: Path,
+    profile: PageProfile,
+) -> ExtractedFigure:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if candidate.embedded_bytes:
+        ext = candidate.embedded_ext.lstrip(".") or config.OUTPUT_IMAGE_FORMAT
+        if ext != out_path.suffix.lstrip("."):
+            out_path = out_path.with_suffix(f".{ext}")
+        out_path.write_bytes(candidate.embedded_bytes)
+    elif candidate.crop is not None:
+        save_bgr(out_path, candidate.crop)
+    else:
+        raise ValueError(f"Candidate {candidate.method} has no image data")
+
+    from src.figure_fusion import score_candidate
+
+    confidence = score_candidate(candidate, profile)
+    return ExtractedFigure(
+        source_path=source_path,
+        page_index=candidate.page_index,
+        figure_index=0,
+        image_path=out_path,
+        method=candidate.method,
+        bbox=candidate.bbox,
+        area_ratio=candidate.area_ratio,
+        figure_type=candidate.figure_type.value,
+        confidence=round(confidence, 4),
+        page_profile=profile.value,
+        text_overlap=round(candidate.text_overlap, 4),
+        completeness=round(candidate.completeness, 4),
+        is_primary=True,
+    )
+
+
+def extract_primary_figures(
+    source_path: Path,
+    pages: list,
+    ocr_results: list[OcrPageResult],
     output_dir: Path,
-    min_area_ratio: float | None = None,
+    *,
+    morphology_by_page: dict[int, MorphologyPageCandidate] | None = None,
 ) -> list[ExtractedFigure]:
-    ratio = min_area_ratio or config.MIN_FIGURE_AREA_RATIO
-    regions = _find_layout_figures(image_bgr, text_boxes, ratio)
-    figures: list[ExtractedFigure] = []
-    for idx, (bbox, area_ratio) in enumerate(regions):
-        x0, y0, x1, y1 = bbox
-        if not _is_valid_photo_bbox(bbox, image_bgr.shape[:2]):
+    """
+    Fuse all extractors per page and emit exactly one primary figure per page
+    (when confidence thresholds pass). Single-page PNG/TIFF → one file;
+    multi-page PDF/TIFF → one file per page.
+    """
+    morphology_by_page = morphology_by_page or {}
+    page_count = len(pages)
+    page_sizes = [(p.width, p.height) for p in pages]
+    img_dir = output_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    embedded_by_page: dict[int, list[FigureCandidate]] = {}
+    if source_path.suffix.lower() == ".pdf":
+        embedded_by_page = _embedded_candidates_by_page(source_path, page_sizes)
+
+    primary_figures: list[ExtractedFigure] = []
+
+    for page, ocr in zip(pages, ocr_results):
+        embedded_count = len(embedded_by_page.get(page.page_index, []))
+        profile = classify_page(
+            page.image,
+            ocr,
+            page_count=page_count,
+            embedded_on_page=embedded_count,
+            is_pdf=source_path.suffix.lower() == ".pdf",
+        )
+        log.info(
+            "Page %d: profile=%s embedded=%d",
+            page.page_index,
+            profile.value,
+            embedded_count,
+        )
+
+        candidates = _collect_page_candidates(
+            page.page_index,
+            page.image,
+            ocr,
+            profile,
+            morphology_by_page.get(page.page_index),
+            embedded_by_page.get(page.page_index, []),
+        )
+
+        winner = select_primary_candidate(candidates, profile)
+        if winner is None:
+            log.info("Page %d: no primary figure emitted", page.page_index)
             continue
-        x0, y0, x1, y1 = finalize_crop_bounds(
-            image_bgr, x0, y0, x1, y1, text_boxes
+
+        out_path = primary_figure_path(output_dir, page.page_index, page_count)
+        primary_figures.append(
+            _save_primary_candidate(source_path, winner, out_path, profile)
         )
-        final_bbox = (x0, y0, x1, y1)
-        if not _is_valid_photo_bbox(final_bbox, image_bgr.shape[:2]):
-            continue
-        crop = image_bgr[y0:y1, x0:x1]
-        area_ratio = (x1 - x0) * (y1 - y0) / (image_bgr.shape[0] * image_bgr.shape[1])
-        out_path = (
-            output_dir
-            / f"{source_path.stem}_p{page_index:03d}_figure_{idx:03d}.{config.OUTPUT_IMAGE_FORMAT}"
-        )
-        save_bgr(out_path, crop)
-        figures.append(
-            ExtractedFigure(
-                source_path=source_path,
-                page_index=page_index,
-                figure_index=idx,
-                image_path=out_path,
-                method="layout",
-                bbox=final_bbox,
-                area_ratio=area_ratio,
-            )
-        )
-    return figures
+
+    log.info(
+        "Primary figure extraction: %d/%d page(s) with output",
+        len(primary_figures),
+        page_count,
+    )
+    return primary_figures
 
 
+# Backward-compatible alias used by older imports.
 def extract_all_figures(
     source_path: Path,
     pages: list,
@@ -428,103 +683,15 @@ def extract_all_figures(
     *,
     morphology_by_page: dict[int, Path | str] | None = None,
 ) -> list[ExtractedFigure]:
-    """
-    Orchestrate figure extraction: embedded PDF, photo heuristics, layout fallback.
-
-    When morphology succeeded for a page, skip photo/layout to avoid duplicate crops.
-    """
-    figures: list[ExtractedFigure] = []
-    img_dir = output_dir / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    page_sizes = [(p.width, p.height) for p in pages]
-    morphology_by_page = morphology_by_page or {}
-
-    for page_index, morph_path in morphology_by_page.items():
-        log.debug("Page %d: using morphology figure %s", page_index, morph_path)
-        figures.append(
-            ExtractedFigure(
-                source_path=source_path,
-                page_index=page_index,
-                figure_index=0,
-                image_path=Path(morph_path),
-                method="morphology",
-                bbox=None,
-                area_ratio=0.0,
-            )
-        )
-
-    if source_path.suffix.lower() == ".pdf":
-        figures.extend(
-            extract_embedded_pdf_images(source_path, img_dir, page_sizes=page_sizes)
-        )
-
-    for page, ocr in zip(pages, ocr_results):
-        if page.page_index in morphology_by_page:
-            log.debug(
-                "Page %d: skipping photo/layout (morphology figure already extracted)",
-                page.page_index,
-            )
-            continue
-
-        projection_figs = extract_projection_figure(
-            page.source_path,
-            page.page_index,
-            page.image,
-            ocr.boxes,
-            img_dir,
-        )
-        if projection_figs:
-            log.info("Page %d: projection figure extracted", page.page_index)
-            figures.extend(projection_figs)
-            continue
-
-        if _is_engineering_line_drawing(page.image):
-            log.debug(
-                "Page %d: skipping manufacturing-photo heuristic (engineering line drawing)",
-                page.page_index,
-            )
-            photos = []
-        else:
-            photos = extract_manufacturing_photo(
-                page.source_path,
-                page.page_index,
-                page.image,
-                img_dir,
-                text_boxes=ocr.boxes,
-            )
-        if photos:
-            bbox = photos[0].bbox
-            if bbox is not None:
-                cov = estimate_text_coverage_in_bbox(bbox, ocr.boxes)
-                if cov > config.PHOTO_MAX_TEXT_COVERAGE:
-                    log.debug(
-                        "Page %d: photo candidate rejected (text coverage %.2f)",
-                        page.page_index,
-                        cov,
-                    )
-                    photos = []
-        if photos:
-            log.info("Page %d: manufacturing photo extracted", page.page_index)
-        figures.extend(photos)
-
-        if not photos:
-            layout_figs = extract_layout_figures(
-                page.source_path,
-                page.page_index,
-                page.image,
-                ocr.boxes,
-                img_dir,
-            )
-            if layout_figs:
-                log.info(
-                    "Page %d: layout figure(s) extracted (%d)",
-                    page.page_index,
-                    len(layout_figs),
-                )
-            figures.extend(layout_figs)
-
-    by_method: dict[str, int] = {}
-    for fig in figures:
-        by_method[fig.method] = by_method.get(fig.method, 0) + 1
-    log.info("Figure extraction summary: %s (total=%d)", by_method, len(figures))
-    return figures
+    """Deprecated: use extract_primary_figures with MorphologyPageCandidate."""
+    log.warning(
+        "extract_all_figures called with legacy morphology paths — "
+        "run extract_primary_figures from the pipeline instead"
+    )
+    return extract_primary_figures(
+        source_path,
+        pages,
+        ocr_results,
+        output_dir,
+        morphology_by_page={},
+    )

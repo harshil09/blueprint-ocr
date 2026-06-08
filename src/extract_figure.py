@@ -714,9 +714,61 @@ def find_main_drawing_bbox_via_projection(
     return (x1, y1, bw, bh)
 
 
+def _profile_key(profile: str | object | None) -> str | None:
+    if profile is None:
+        return None
+    if hasattr(profile, "value"):
+        return str(profile.value)
+    return str(profile)
+
+
+def _uses_engineering_crop_limits(profile: str | object | None) -> bool:
+    key = _profile_key(profile)
+    return key is None or key in config.ENGINEERING_PROFILES
+
+
+def _crop_limit_values(
+    profile: str | object | None,
+) -> tuple[float, float, float, float]:
+    """Return max_aspect, min_height_ratio, min_width_ratio, min_area_ratio."""
+    if _uses_engineering_crop_limits(profile):
+        return (
+            config.ENGINEERING_MAX_CROP_ASPECT_RATIO,
+            config.ENGINEERING_MIN_CROP_HEIGHT_RATIO,
+            config.ENGINEERING_MIN_CROP_WIDTH_RATIO,
+            config.MIN_CROP_AREA_RATIO,
+        )
+    return (
+        config.MAX_CROP_ASPECT_RATIO,
+        config.MIN_CROP_HEIGHT_RATIO,
+        config.MIN_CROP_WIDTH_RATIO,
+        config.MIN_CROP_AREA_RATIO,
+    )
+
+
+def line_art_density_in_bbox(
+    image_bgr: np.ndarray,
+    bbox_xyxy: tuple[int, int, int, int],
+    text_boxes: list[TextBox] | None = None,
+) -> float:
+    """Fraction of bbox pixels that are line-art ink (edges/thin strokes, not text)."""
+    h, w = image_bgr.shape[:2]
+    x0, y0, x1, y1 = bbox_xyxy
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    mask = build_line_art_mask(image_bgr, text_boxes)
+    roi = mask[y0:y1, x0:x1]
+    return float(np.count_nonzero(roi)) / max(roi.size, 1)
+
+
 def is_valid_figure_crop(
     box: tuple[int, int, int, int],
     page_shape: tuple[int, int],
+    profile: str | object | None = None,
+    *,
+    line_art_density: float | None = None,
 ) -> bool:
     """Reject edge slivers, tiny fragments, and extreme aspect ratios."""
     ph, pw = page_shape
@@ -724,19 +776,27 @@ def is_valid_figure_crop(
     if bw <= 0 or bh <= 0:
         return False
 
+    max_aspect, min_h_ratio, min_w_ratio, min_area = _crop_limit_values(profile)
     area_ratio = (bw * bh) / max(ph * pw, 1)
     aspect = bw / max(bh, 1)
+    height_ratio = bh / max(ph, 1)
 
-    if area_ratio < config.MIN_CROP_AREA_RATIO:
+    if area_ratio < min_area:
         return False
     if area_ratio > config.MAX_FIGURE_OUTPUT_AREA_RATIO:
         return False
-    if aspect < config.MIN_CROP_ASPECT_RATIO or aspect > config.MAX_CROP_ASPECT_RATIO:
+    if aspect < config.MIN_CROP_ASPECT_RATIO or aspect > max_aspect:
         return False
-    if bw < pw * config.MIN_CROP_WIDTH_RATIO:
+    if bw < pw * min_w_ratio:
         return False
-    if bh < ph * config.MIN_CROP_HEIGHT_RATIO:
+    if height_ratio < min_h_ratio:
         return False
+
+    # Wide shallow crops must contain enough line art (blocks empty dimension strips).
+    if aspect > 4.0 and height_ratio < 0.22:
+        density = line_art_density if line_art_density is not None else 0.0
+        if density < config.ENGINEERING_MIN_LINE_ART_DENSITY:
+            return False
     return True
 
 
@@ -884,6 +944,354 @@ def _content_mask_in_region(gray: np.ndarray) -> np.ndarray:
     ink = (gray < config.CROP_INK_GRAY_MAX).astype(np.uint8) * 255
     edges = cv2.Canny(gray, 25, 90)
     return cv2.bitwise_or(ink, edges)
+
+
+def _detect_dense_text_block_mask(gray: np.ndarray) -> np.ndarray:
+    """Mask filled text/table blocks (title block paragraphs, notes)."""
+    h, w = gray.shape
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        11,
+    )
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 3))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_h, iterations=1)
+    closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, kernel_v, iterations=1)
+
+    page_area = h * w
+    min_area = int(page_area * config.DENSE_TEXT_BLOCK_MIN_AREA_RATIO)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    max_block_area = int(page_area * config.DENSE_TEXT_BLOCK_MAX_AREA_RATIO)
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        block_area = cw * ch
+        if block_area < min_area or block_area > max_block_area:
+            continue
+        if block_area > page_area * 0.22:
+            continue
+        roi = closed[y : y + ch, x : x + cw]
+        fill = float(np.count_nonzero(roi)) / max(roi.size, 1)
+        if fill >= config.DENSE_TEXT_BLOCK_MIN_FILL:
+            mask[y : y + ch, x : x + cw] = 255
+    return mask
+
+
+def build_line_art_mask(
+    image_bgr: np.ndarray,
+    text_boxes: list[TextBox] | None = None,
+) -> np.ndarray:
+    """Edges and thin strokes with OCR + dense text regions removed."""
+    h, w = image_bgr.shape[:2]
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(
+        gray,
+        config.LINE_ART_CANNY_LOW,
+        config.LINE_ART_CANNY_HIGH,
+    )
+    thin = cv2.erode(
+        (gray < config.CROP_INK_GRAY_MAX).astype(np.uint8) * 255,
+        np.ones((2, 2), np.uint8),
+        iterations=1,
+    )
+    line_art = cv2.bitwise_or(edges, thin)
+
+    exclude = build_text_mask((h, w), text_boxes or [], include_layout_zones=False)
+    exclude = cv2.bitwise_or(exclude, _detect_dense_text_block_mask(gray))
+    line_art[exclude > 0] = 0
+
+    speckle_kernel = np.ones((3, 3), np.uint8)
+    line_art = cv2.morphologyEx(line_art, cv2.MORPH_OPEN, speckle_kernel, iterations=1)
+
+    margin_x = int(w * config.BORDER_MARGIN_RATIO)
+    margin_y = int(h * config.BORDER_MARGIN_RATIO)
+    line_art[:margin_y, :] = 0
+    line_art[h - margin_y :, :] = 0
+    line_art[:, :margin_x] = 0
+    line_art[:, w - margin_x :] = 0
+    return line_art
+
+
+def _line_art_strip_density(mask: np.ndarray, edge: str, strip_px: int) -> float:
+    mh, mw = mask.shape[:2]
+    s = max(2, strip_px)
+    if edge == "top":
+        roi = mask[: min(s, mh), :]
+    elif edge == "bottom":
+        roi = mask[max(0, mh - s) :, :]
+    elif edge == "left":
+        roi = mask[:, : min(s, mw)]
+    else:
+        roi = mask[:, max(0, mw - s) :]
+    if roi.size == 0:
+        return 0.0
+    return float(np.count_nonzero(roi)) / roi.size
+
+
+def tighten_bbox_to_line_art(
+    image_bgr: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    text_boxes: list[TextBox] | None = None,
+) -> tuple[int, int, int, int]:
+    """
+    Tighten crop to line-art ink: trim empty margins; expand vertically only
+    for wide shallow seeds (side views like fuselage profiles).
+    """
+    h, w = image_bgr.shape[:2]
+    if x2 <= x1 or y2 <= y1:
+        return x1, y1, x2, y2
+
+    mask = build_line_art_mask(image_bgr, text_boxes)
+    bw, bh = x2 - x1, y2 - y1
+    aspect = bw / max(bh, 1)
+    seed_area = bw * bh
+    seed = (x1, y1, x2, y2)
+    max_area = int(h * w * config.MAX_FIGURE_OUTPUT_AREA_RATIO)
+
+    seed_mask = mask[y1:y2, x1:x2]
+    if seed_mask.size == 0 or np.count_nonzero(seed_mask) < 24:
+        return seed
+
+    # Wide shallow seed: allow vertical growth within search band.
+    if aspect > 3.0:
+        pad_y = max(
+            int(bh * config.LINE_ART_TIGHTEN_SEARCH_RATIO),
+            int(h * config.LINE_ART_TIGHTEN_WIDE_VERTICAL_SEARCH_RATIO),
+        )
+        sy1 = max(0, y1 - pad_y)
+        sy2 = min(h, y2 + pad_y)
+        row_sum = mask[sy1:sy2, x1:x2].sum(axis=1).astype(np.float32)
+        if row_sum.max() > 4:
+            row_thresh = max(row_sum.max() * config.LINE_ART_ROW_COL_THRESH_FRAC, 4.0)
+            rows = np.where(row_sum >= row_thresh)[0]
+            if len(rows) >= 2:
+                y1 = sy1 + int(rows[0])
+                y2 = sy1 + int(rows[-1]) + 1
+
+    # Shrink empty margins on all four sides.
+    strip_px = max(8, int(min(x2 - x1, y2 - y1) * 0.04))
+    edge_thresh = 0.006
+    for _ in range(24):
+        roi = mask[y1:y2, x1:x2]
+        if roi.size == 0:
+            break
+        changed = False
+        if y2 - y1 > 40 and _line_art_strip_density(roi, "top", strip_px) < edge_thresh:
+            y1 += max(2, strip_px // 2)
+            changed = True
+        if y2 - y1 > 40 and _line_art_strip_density(roi, "bottom", strip_px) < edge_thresh:
+            y2 -= max(2, strip_px // 2)
+            changed = True
+        if x2 - x1 > 40 and _line_art_strip_density(roi, "left", strip_px) < edge_thresh:
+            x1 += max(2, strip_px // 2)
+            changed = True
+        if x2 - x1 > 40 and _line_art_strip_density(roi, "right", strip_px) < edge_thresh:
+            x2 -= max(2, strip_px // 2)
+            changed = True
+        if not changed:
+            break
+        if (x2 - x1) * (y2 - y1) < seed_area * 0.35:
+            break
+
+    margin_x = max(int((x2 - x1) * config.LINE_ART_TIGHTEN_MARGIN_RATIO), config.LINE_ART_TIGHTEN_MIN_MARGIN_PX)
+    margin_y = max(int((y2 - y1) * config.LINE_ART_TIGHTEN_MARGIN_RATIO), config.LINE_ART_TIGHTEN_MIN_MARGIN_PX)
+    nx1 = max(0, x1 - margin_x)
+    ny1 = max(0, y1 - margin_y)
+    nx2 = min(w, x2 + margin_x)
+    ny2 = min(h, y2 + margin_y)
+
+    tightened = (nx1, ny1, nx2, ny2)
+    if (nx2 - nx1) * (ny2 - ny1) > max_area:
+        tightened = (
+            max(0, x1 - margin_x // 2),
+            max(0, y1 - margin_y // 2),
+            min(w, x2 + margin_x // 2),
+            min(h, y2 + margin_y // 2),
+        )
+    if tightened[2] <= tightened[0] + 5 or tightened[3] <= tightened[1] + 5:
+        return seed
+
+    tight_area = (tightened[2] - tightened[0]) * (tightened[3] - tightened[1])
+    if tight_area < seed_area * config.TIGHTEN_MIN_RETAINED_AREA_FRAC:
+        return seed
+    return tightened
+
+
+def _text_overlap_on_edge_strip(
+    bbox_xyxy: tuple[int, int, int, int],
+    text_boxes: list[TextBox],
+    edge: str,
+    strip_px: int,
+) -> float:
+    x0, y0, x1, y1 = bbox_xyxy
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        return 0.0
+
+    if edge == "top":
+        strip = (x0, y0, x1, min(y1, y0 + strip_px))
+    elif edge == "bottom":
+        strip = (x0, max(y0, y1 - strip_px), x1, y1)
+    elif edge == "left":
+        strip = (x0, y0, min(x1, x0 + strip_px), y1)
+    else:
+        strip = (max(x0, x1 - strip_px), y0, x1, y1)
+    return estimate_text_coverage_in_bbox(strip, text_boxes)
+
+
+def shrink_bbox_from_text_overlap(
+    image_bgr: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    text_boxes: list[TextBox] | None,
+) -> tuple[int, int, int, int]:
+    """Trim crop edges that contain OCR text until overlap is below target."""
+    if not text_boxes:
+        return x1, y1, x2, y2
+
+    h, w = image_bgr.shape[:2]
+    orig_area = max((x2 - x1) * (y2 - y1), 1)
+    bbox = (x1, y1, x2, y2)
+
+    for _ in range(config.TEXT_SHRINK_MAX_ITERATIONS):
+        overlap = estimate_text_coverage_in_bbox(bbox, text_boxes)
+        if overlap <= config.TEXT_SHRINK_TARGET_OVERLAP:
+            break
+
+        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        step_x = max(2, int(bw * config.TEXT_SHRINK_STEP_RATIO))
+        step_y = max(2, int(bh * config.TEXT_SHRINK_STEP_RATIO))
+        strip_px = max(12, int(min(bw, bh) * 0.06))
+
+        edges = ("top", "bottom", "left", "right")
+        edge_scores = {
+            e: _text_overlap_on_edge_strip(bbox, text_boxes, e, strip_px) for e in edges
+        }
+        edge = max(edges, key=lambda e: edge_scores[e])
+        if edge_scores[edge] < 0.01:
+            break
+
+        bx0, by0, bx1, by1 = bbox
+        if edge == "top":
+            by0 = min(by1 - 10, by0 + step_y)
+        elif edge == "bottom":
+            by1 = max(by0 + 10, by1 - step_y)
+        elif edge == "left":
+            bx0 = min(bx1 - 10, bx0 + step_x)
+        else:
+            bx1 = max(bx0 + 10, bx1 - step_x)
+
+        new_area = max((bx1 - bx0) * (by1 - by0), 1)
+        if new_area < orig_area * config.TEXT_SHRINK_MIN_REMAINING_RATIO:
+            break
+        if line_art_density_in_bbox(image_bgr, (bx0, by0, bx1, by1), text_boxes) < config.ENGINEERING_MIN_LINE_ART_DENSITY * 0.5:
+            break
+        bbox = (bx0, by0, bx1, by1)
+
+    return bbox
+
+
+def refine_figure_crop_bounds(
+    image_bgr: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    text_boxes: list[TextBox] | None = None,
+    profile: str | object | None = None,
+) -> tuple[int, int, int, int]:
+    """Line-art tighten then post-crop text shrink."""
+    x1, y1, x2, y2 = tighten_bbox_to_line_art(image_bgr, x1, y1, x2, y2, text_boxes)
+    x1, y1, x2, y2 = shrink_bbox_from_text_overlap(
+        image_bgr, x1, y1, x2, y2, text_boxes
+    )
+    return x1, y1, x2, y2
+
+
+def _validate_and_crop(
+    image_bgr: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    text_boxes: list[TextBox] | None,
+    profile: str | object | None,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    if x2 <= x1 or y2 <= y1:
+        return None
+    final_box = (x1, y1, x2 - x1, y2 - y1)
+    density = line_art_density_in_bbox(image_bgr, (x1, y1, x2, y2), text_boxes)
+    if not is_valid_figure_crop(
+        final_box,
+        image_bgr.shape[:2],
+        profile,
+        line_art_density=density,
+    ):
+        return None
+    return image_bgr[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
+
+
+def _pad_detection_bbox_xyxy(
+    box_xywh: tuple[int, int, int, int],
+    page_shape: tuple[int, int],
+    *,
+    pad_ratio: float | None = None,
+) -> tuple[int, int, int, int]:
+    """Light padding on a detector bbox without full-page finalize expansion."""
+    ph, pw = page_shape
+    x, y, bw, bh = box_xywh
+    ratio = pad_ratio if pad_ratio is not None else config.FINAL_EXPANSION_RATIO
+    pad_x = max(int(bw * ratio), config.LINE_ART_TIGHTEN_MIN_MARGIN_PX)
+    pad_y = max(int(bh * ratio), config.LINE_ART_TIGHTEN_MIN_MARGIN_PX)
+    return (
+        max(0, x - pad_x),
+        max(0, y - pad_y),
+        min(pw, x + bw + pad_x),
+        min(ph, y + bh + pad_y),
+    )
+
+
+def prepare_primary_crop(
+    image_bgr: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    text_boxes: list[TextBox] | None,
+    profile: str | object | None = None,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """
+    Refine bbox, validate with profile limits, return crop and xyxy bbox.
+    """
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    seed = (x1, y1, x2, y2)
+    rx1, ry1, rx2, ry2 = refine_figure_crop_bounds(
+        image_bgr, x1, y1, x2, y2, text_boxes, profile=profile
+    )
+    result = _validate_and_crop(
+        image_bgr, rx1, ry1, rx2, ry2, text_boxes, profile
+    )
+    if result is not None:
+        return result
+
+    # Fallback: text-shrink seed only (avoid failed tighten on photo-heavy PDFs).
+    sx1, sy1, sx2, sy2 = shrink_bbox_from_text_overlap(
+        image_bgr, seed[0], seed[1], seed[2], seed[3], text_boxes
+    )
+    return _validate_and_crop(
+        image_bgr, sx1, sy1, sx2, sy2, text_boxes, profile
+    )
 
 
 def finalize_crop_bounds(
@@ -1115,26 +1523,17 @@ def _prepare_binary_and_candidates(
     return page_h, page_w, candidates, selection
 
 
-def extract_engineering_figure(
+def compute_engineering_figure_crop(
     image: np.ndarray,
-    output_path: str | Path,
     text_boxes: list[TextBox] | None = None,
     *,
     apply_text_mask: bool = True,
-) -> Path | None:
-    path, _ = extract_engineering_figure_with_metadata(
-        image, output_path, text_boxes, apply_text_mask=apply_text_mask
-    )
-    return path
+) -> tuple[np.ndarray, tuple[int, int, int, int], FigureSelectionResult] | None:
+    """
+    Run the morphology/projection pipeline and return the crop in memory.
 
-
-def extract_engineering_figure_with_metadata(
-    image: np.ndarray,
-    output_path: str | Path,
-    text_boxes: list[TextBox] | None = None,
-    *,
-    apply_text_mask: bool = True,
-) -> tuple[Path | None, FigureSelectionResult | None]:
+    Returns (crop_bgr, bbox_xyxy, selection) or None when no valid crop exists.
+    """
     if image is None:
         raise ValueError("Input image is None")
 
@@ -1142,9 +1541,9 @@ def extract_engineering_figure_with_metadata(
         image, text_boxes, apply_text_mask=apply_text_mask
     )
 
-    best_box, source = select_best_drawing_box(image, selection, text_boxes)
+    best_box, _source = select_best_drawing_box(image, selection, text_boxes)
     if best_box is None:
-        return None, None
+        return None
 
     if selection is None or best_box != selection.box:
         quality = validate_crop_candidate(image, best_box, text_boxes)
@@ -1170,27 +1569,78 @@ def extract_engineering_figure_with_metadata(
     x1, y1, x2, y2 = finalize_crop_bounds(image, x1, y1, x2, y2, text_boxes)
     x1, y1, x2, y2 = _fit_crop_to_max_area(x1, y1, x2, y2, h, w)
     if y2 <= y1 + 10:
-        return None, None
+        return None
 
-    final_box = (x1, y1, x2 - x1, y2 - y1)
-    if not is_valid_figure_crop(final_box, (h, w)):
+    prepared = prepare_primary_crop(
+        image, x1, y1, x2, y2, text_boxes, profile="engineering_sheet"
+    )
+    crop_area_ratio = (x2 - x1) * (y2 - y1) / max(h * w, 1)
+    if prepared is None or crop_area_ratio > config.MAX_FIGURE_OUTPUT_AREA_RATIO * 0.88:
+        proj_box = find_main_drawing_bbox_via_projection(image, text_boxes)
+        if proj_box is not None:
+            px1, py1, px2, py2 = _pad_detection_bbox_xyxy(proj_box, (h, w))
+            alt = prepare_primary_crop(
+                image, px1, py1, px2, py2, text_boxes, profile="engineering_sheet"
+            )
+            if alt is not None:
+                alt_area = (alt[1][2] - alt[1][0]) * (alt[1][3] - alt[1][1]) / max(h * w, 1)
+                if prepared is None or alt_area < crop_area_ratio * 0.85:
+                    prepared = alt
+                    log.info(
+                        "Using tighter projection crop (%.1f%% vs morphology %.1f%% of page)",
+                        100 * alt_area,
+                        100 * crop_area_ratio,
+                    )
+
+    if prepared is None:
+        final_box = (x1, y1, x2 - x1, y2 - y1)
         log.info(
             "Engineering figure crop rejected (invalid geometry %dx%d, %.1f%% of page)",
             final_box[2],
             final_box[3],
             100.0 * final_box[2] * final_box[3] / (h * w),
         )
-        return None, None
+        return None
 
-    cropped = image[y1:y2, x1:x2]
+    cropped, (x1, y1, x2, y2) = prepared
     crop_area = (x2 - x1) * (y2 - y1)
     if crop_area / max(h * w, 1) > config.MAX_FIGURE_OUTPUT_AREA_RATIO:
         log.info(
-            "Engineering figure crop too large (%.1f%% of page); skipping save",
+            "Engineering figure crop too large (%.1f%% of page); skipping",
             100.0 * crop_area / (h * w),
         )
+        return None
+
+    return cropped, (x1, y1, x2, y2), selection
+
+
+def extract_engineering_figure(
+    image: np.ndarray,
+    output_path: str | Path,
+    text_boxes: list[TextBox] | None = None,
+    *,
+    apply_text_mask: bool = True,
+) -> Path | None:
+    path, _ = extract_engineering_figure_with_metadata(
+        image, output_path, text_boxes, apply_text_mask=apply_text_mask
+    )
+    return path
+
+
+def extract_engineering_figure_with_metadata(
+    image: np.ndarray,
+    output_path: str | Path,
+    text_boxes: list[TextBox] | None = None,
+    *,
+    apply_text_mask: bool = True,
+) -> tuple[Path | None, FigureSelectionResult | None]:
+    result = compute_engineering_figure_crop(
+        image, text_boxes, apply_text_mask=apply_text_mask
+    )
+    if result is None:
         return None, None
 
+    cropped, _bbox, selection = result
     output_path = Path(output_path)
     save_bgr(output_path, cropped)
     return output_path, selection
