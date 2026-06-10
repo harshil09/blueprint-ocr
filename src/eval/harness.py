@@ -12,9 +12,16 @@ from src.eval.categories import FailureCategory
 from src.eval.labels import EvalManifest, LabeledPage, load_manifest
 from src.eval.metrics import PageEvalResult, evaluate_page_crop
 from src.extract_figure import compute_engineering_figure_crop
+from src.figure_fusion import classify_page
 from src.image_extractor import (
     MorphologyPageCandidate,
+    embedded_image_counts_by_page,
     extract_primary_figures,
+)
+from src.profile_config import (
+    apply_dynamic_layout_zones,
+    get_profile_config,
+    resolve_crop_profile,
 )
 from src.logger import get_logger
 from src.ocr.ocr_router import OcrRouter
@@ -40,10 +47,52 @@ class EvalReport:
         return asdict(self)
 
 
-def _morphology_by_page(pages, ocr_results) -> dict[int, MorphologyPageCandidate]:
+def _morphology_by_page(
+    pages,
+    ocr_results,
+    *,
+    source_path: Path,
+) -> dict[int, MorphologyPageCandidate]:
     by_page: dict[int, MorphologyPageCandidate] = {}
+    is_pdf = source_path.suffix.lower() == ".pdf"
+    page_count = len(pages)
+    embedded_counts = (
+        embedded_image_counts_by_page(
+            source_path,
+            page_sizes=[(p.width, p.height) for p in pages],
+        )
+        if is_pdf
+        else {}
+    )
     for page, ocr in zip(pages, ocr_results):
-        result = compute_engineering_figure_crop(page.image, ocr.boxes)
+        embedded_on_page = embedded_counts.get(page.page_index, 0)
+        page_profile = classify_page(
+            page.image,
+            ocr,
+            page_count=page_count,
+            embedded_on_page=embedded_on_page,
+            is_pdf=is_pdf,
+        )
+        crop_profile = resolve_crop_profile(
+            page_profile,
+            page.image,
+            ocr,
+            is_pdf=is_pdf,
+            embedded_on_page=embedded_on_page,
+            page_count=page_count,
+            source_suffix=source_path.suffix,
+        )
+        morph_pcfg = apply_dynamic_layout_zones(
+            get_profile_config(crop_profile),
+            ocr,
+            page.image.shape[:2],
+        )
+        result = compute_engineering_figure_crop(
+            page.image,
+            ocr.boxes,
+            profile=page_profile,
+            profile_config=morph_pcfg,
+        )
         if result is None:
             continue
         crop, bbox_xyxy, selection = result
@@ -109,7 +158,9 @@ def evaluate_labeled_page(
 
     target_page = pages[label.page_index]
     ocr_results = [router.recognize_page(p.image) for p in pages]
-    morph_map = _morphology_by_page(pages, ocr_results)
+    morph_map = _morphology_by_page(
+        pages, ocr_results, source_path=label.source_path
+    )
 
     eval_out = output_dir or Path("/tmp/figure_eval") / label.id
     eval_out.mkdir(parents=True, exist_ok=True)

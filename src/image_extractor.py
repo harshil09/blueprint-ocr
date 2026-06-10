@@ -40,6 +40,7 @@ from src.profile_config import (
     get_profile_config,
     log_page_profile_assignment,
     resolve_crop_profile,
+    resolve_effective_profile_config,
 )
 from src.logger import get_logger
 from src.ocr.ocr_engine import OcrPageResult, TextBox
@@ -119,6 +120,45 @@ def _skip_embedded_for_fusion(
         ) and area_ratio > 0.07:
             return True
     return False
+
+
+def embedded_image_counts_by_page(
+    pdf_path: Path,
+    *,
+    page_sizes: list[tuple[int, int]] | None = None,
+    min_bytes: int | None = None,
+    full_page_only: bool = True,
+) -> dict[int, int]:
+    """
+    Count embedded raster images per PDF page (above size threshold).
+
+    When ``full_page_only`` is True (default), only full-page scan embeds are
+    counted — small logos or partial figures do not trigger scanned-PDF routing.
+    """
+    threshold = min_bytes if min_bytes is not None else config.MIN_EMBEDDED_IMAGE_BYTES
+    counts: dict[int, int] = {}
+    doc = fitz.open(pdf_path)
+    try:
+        for page_i, page in enumerate(doc):
+            pw, ph = (0, 0)
+            if page_sizes and page_i < len(page_sizes):
+                pw, ph = page_sizes[page_i]
+            n = 0
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                base = doc.extract_image(xref)
+                if not base or len(base.get("image", b"")) < threshold:
+                    continue
+                iw, ih = base.get("width", 0), base.get("height", 0)
+                if full_page_only and pw and ph:
+                    if not _is_full_page_embedded(iw, ih, pw, ph):
+                        continue
+                n += 1
+            if n:
+                counts[page_i] = n
+    finally:
+        doc.close()
+    return counts
 
 
 def _is_full_page_embedded(
@@ -710,16 +750,23 @@ def extract_primary_figures(
     img_dir.mkdir(parents=True, exist_ok=True)
 
     is_pdf = source_path.suffix.lower() == ".pdf"
+    embedded_counts = (
+        embedded_image_counts_by_page(source_path, page_sizes=page_sizes)
+        if is_pdf
+        else {}
+    )
     page_profiles: dict[int, PageProfile] = {}
     crop_profiles: dict[int, CropProfile] = {}
     pcfg_by_page: dict[int, ProfileConfig] = {}
+    scale_by_page: dict[int, dict] = {}
 
     for page, ocr in zip(pages, ocr_results):
+        embedded_on_page = embedded_counts.get(page.page_index, 0)
         profile = classify_page(
             page.image,
             ocr,
             page_count=page_count,
-            embedded_on_page=0,
+            embedded_on_page=embedded_on_page,
             is_pdf=is_pdf,
         )
         page_profiles[page.page_index] = profile
@@ -731,12 +778,19 @@ def extract_primary_figures(
             ocr,
             seed_bbox_xyxy=seed_bbox,
             is_pdf=is_pdf,
-            embedded_on_page=0,
+            embedded_on_page=embedded_on_page,
             page_count=page_count,
             source_suffix=source_path.suffix,
         )
         crop_profiles[page.page_index] = crop_profile
-        pcfg_by_page[page.page_index] = get_profile_config(crop_profile)
+        pcfg, _metrics, scale_summary = resolve_effective_profile_config(
+            crop_profile,
+            page.image,
+            ocr,
+            seed_bbox_xyxy=seed_bbox,
+        )
+        pcfg_by_page[page.page_index] = pcfg
+        scale_by_page[page.page_index] = scale_summary
 
     embedded_by_page: dict[int, list[FigureCandidate]] = {}
     if is_pdf:
@@ -779,6 +833,7 @@ def extract_primary_figures(
             embedded_count=embedded_count,
             figure_method=winner.method if winner else None,
             figure_emitted=winner is not None,
+            scale_summary=scale_by_page.get(page.page_index),
         )
 
         if winner is None:

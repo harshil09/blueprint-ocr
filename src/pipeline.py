@@ -11,10 +11,17 @@ from tqdm import tqdm
 from src import config
 from src.document_loader import PageImage, load_document
 from src.extract_figure import compute_engineering_figure_crop
+from src.figure_fusion import classify_page
 from src.image_extractor import (
     ExtractedFigure,
     MorphologyPageCandidate,
+    embedded_image_counts_by_page,
     extract_primary_figures,
+)
+from src.profile_config import (
+    apply_dynamic_layout_zones,
+    get_profile_config,
+    resolve_crop_profile,
 )
 from src.keyword_extractor import extract_keywords, keywords_as_strings
 from src.logger import get_logger
@@ -237,6 +244,16 @@ class ExtractionPipeline:
         else:
             log.info("OCR accuracy measurement disabled (OCR_ACCURACY_ENABLED=False)")
 
+        is_pdf_doc = path.suffix.lower() == ".pdf"
+        embedded_counts = (
+            embedded_image_counts_by_page(
+                path,
+                page_sizes=[(p.width, p.height) for p in pages],
+            )
+            if is_pdf_doc
+            else {}
+        )
+
         for page in tqdm(pages, desc=f"OCR {path.name}", unit="page"):
             log.info(
                 "--- Page %d/%d (%dx%d) ---",
@@ -301,10 +318,34 @@ class ExtractionPipeline:
                                 pipeline_metrics.word_accuracy * 100,
                             )
 
+            embedded_on_page = embedded_counts.get(page.page_index, 0)
+            page_profile = classify_page(
+                page.image,
+                ocr,
+                page_count=page_count,
+                embedded_on_page=embedded_on_page,
+                is_pdf=is_pdf_doc,
+            )
+            crop_profile = resolve_crop_profile(
+                page_profile,
+                page.image,
+                ocr,
+                is_pdf=is_pdf_doc,
+                embedded_on_page=embedded_on_page,
+                page_count=page_count,
+                source_suffix=path.suffix,
+            )
+            morph_pcfg = apply_dynamic_layout_zones(
+                get_profile_config(crop_profile),
+                ocr,
+                page.image.shape[:2],
+            )
             morph_result = compute_engineering_figure_crop(
                 page.image,
                 text_boxes=ocr.boxes,
                 apply_text_mask=True,
+                profile=page_profile,
+                profile_config=morph_pcfg,
             )
             selection = None
             if morph_result is not None:

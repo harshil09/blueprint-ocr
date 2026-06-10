@@ -22,6 +22,8 @@ line-art settings, method priors, etc.).
 
 1. `classify_page()` → `PageProfile` (coarse page type)
 2. `resolve_crop_profile()` → `CropProfile` (refined using seed bbox / PDF hints)
-3. `get_profile_config()` → `ProfileConfig` used by crop validation, fusion, and refinement
+3. `apply_dynamic_layout_zones()` → OCR-driven title-block expansion
+4. `resolve_effective_profile_config()` → scaled `ProfileConfig` (when `PAGE_DERIVED_SCALING_ENABLED`)
+5. Crop path uses `prepare_primary_crop()` with tighten-on-reject and drawing-zone merger
 
 To tune behavior, edit the corresponding row in `PROFILE_TABLE` rather than global `config.py` knobs.

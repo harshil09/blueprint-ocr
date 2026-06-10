@@ -9,9 +9,10 @@ crop profile; ``resolve_crop_profile`` may refine that choice from page metrics.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -340,6 +341,7 @@ def log_page_profile_assignment(
     embedded_count: int = 0,
     figure_method: str | None = None,
     figure_emitted: bool = True,
+    scale_summary: dict[str, Any] | None = None,
 ) -> None:
     """
     Log which image/page uses which ProfileConfig bundle.
@@ -357,12 +359,19 @@ def log_page_profile_assignment(
 
     size_str = f"{page_size[0]}x{page_size[1]}" if page_size else "unknown"
     summary = profile_config_summary(pcfg)
+    scale_str = ""
+    if scale_summary:
+        scale_str = (
+            f" | scale={scale_summary.get('scaling', 'n/a')}"
+            f" area_mult={scale_summary.get('area_mult', 'n/a')}"
+            f" text_mult={scale_summary.get('text_mult', 'n/a')}"
+        )
 
     log.info(
         "PROFILE_CONFIG | file=%s | page=%d | size=%s | page_profile=%s | "
         "crop_profile=%s | embedded=%d | seed_aspect=%s | figure_method=%s | "
         "figure_emitted=%s | max_aspect=%.2f | max_area=%.2f | max_text_overlap=%.2f | "
-        "min_confidence=%.2f",
+        "min_confidence=%.2f%s",
         source.name,
         page_index,
         size_str,
@@ -376,6 +385,7 @@ def log_page_profile_assignment(
         pcfg.max_figure_output_area_ratio,
         pcfg.primary_figure_max_text_overlap,
         pcfg.primary_figure_min_confidence,
+        scale_str,
     )
     log.debug("PROFILE_CONFIG detail | file=%s | page=%d | %s", source.name, page_index, summary)
 
@@ -383,6 +393,285 @@ def log_page_profile_assignment(
 def get_profile_config(crop_profile: CropProfile) -> ProfileConfig:
     """Return the config bundle for a crop profile."""
     return PROFILE_TABLE[crop_profile]
+
+
+def effective_max_figure_output_area(pcfg: ProfileConfig) -> float:
+    """Profile max area with cad_wide product cap applied."""
+    if pcfg.crop_profile == CropProfile.CAD_WIDE:
+        return min(
+            pcfg.max_figure_output_area_ratio,
+            config.CAD_WIDE_MAX_OUTPUT_AREA_RATIO,
+        )
+    return pcfg.max_figure_output_area_ratio
+
+
+def detect_scanned_raster_page(
+    image_bgr: np.ndarray,
+    ocr: OcrPageResult | None = None,
+    *,
+    embedded_on_page: int = 0,
+) -> bool:
+    """
+    Detect rasterized scanned PDF pages (full-page scan, not born-digital vector).
+
+    Used when ``embedded_on_page`` is zero but the rendered page is still a
+    high-resolution grayscale scan.
+    """
+    ph, pw = image_bgr.shape[:2]
+    min_side = min(ph, pw)
+    if min_side < config.SCANNED_PAGE_MIN_SIDE_PX:
+        return False
+
+    saturation = _mean_saturation(image_bgr)
+    edge_density = _edge_density(image_bgr)
+    if saturation > config.SCANNED_PAGE_SATURATION_MAX:
+        return False
+    if edge_density < config.SCANNED_PAGE_MIN_EDGE_DENSITY:
+        return False
+    if edge_density > config.SCANNED_PAGE_MAX_EDGE_DENSITY:
+        return False
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    if lap_var < config.SCANNED_PAGE_MIN_LAPLACIAN_VAR:
+        return False
+
+    ocr_box_count = len(ocr.boxes) if ocr is not None else 0
+    page_area = ph * pw
+
+    if min_side >= 3000 and saturation < 18.0 and edge_density >= 0.008:
+        return True
+    if min_side >= 2400 and ocr_box_count >= 15 and saturation < 20.0:
+        return True
+    if page_area >= 12_000_000 and saturation < 16.0 and edge_density >= 0.007:
+        return True
+    return False
+
+
+def _edge_density(image_bgr: np.ndarray) -> float:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    return float(np.count_nonzero(edges) / max(edges.size, 1))
+
+
+def _mean_saturation(image_bgr: np.ndarray) -> float:
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    return float(hsv[:, :, 1].mean())
+
+
+# ---------------------------------------------------------------------------
+# Dynamic layout zones (OCR-driven title block / notes expansion)
+# ---------------------------------------------------------------------------
+
+
+def apply_dynamic_layout_zones(
+    pcfg: ProfileConfig,
+    ocr: OcrPageResult | None,
+    page_shape: tuple[int, int],
+) -> ProfileConfig:
+    """
+    Expand title-block and bottom-band masks when OCR clusters indicate dense
+    annotation regions (typical engineering title blocks).
+    """
+    if ocr is None or not ocr.boxes:
+        return pcfg
+
+    ph, pw = page_shape
+    bottom_count = 0
+    bottom_right_count = 0
+    for box in ocr.boxes:
+        x0, y0, x1, y1 = box.bbox
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        if cy >= ph * 0.60:
+            bottom_count += 1
+        if cy >= ph * 0.56 and cx >= pw * 0.46:
+            bottom_right_count += 1
+
+    title_w = pcfg.title_block_width_ratio
+    bottom_band = pcfg.bottom_annotation_band_ratio
+    notes_h = pcfg.notes_block_height_ratio
+
+    if bottom_right_count >= 6:
+        title_w = min(0.62, title_w + 0.06)
+        bottom_band = min(0.52, bottom_band + 0.05)
+    elif bottom_count >= 12:
+        bottom_band = min(0.48, bottom_band + 0.04)
+        title_w = min(0.58, title_w + 0.03)
+
+    top_left_count = sum(
+        1
+        for box in ocr.boxes
+        if (box.bbox[0] + box.bbox[2]) / 2 < pw * 0.42
+        and (box.bbox[1] + box.bbox[3]) / 2 < ph * 0.30
+    )
+    if top_left_count >= 8:
+        notes_h = min(0.34, notes_h + 0.04)
+
+    if (
+        title_w == pcfg.title_block_width_ratio
+        and bottom_band == pcfg.bottom_annotation_band_ratio
+        and notes_h == pcfg.notes_block_height_ratio
+    ):
+        return pcfg
+
+    return replace(
+        pcfg,
+        title_block_width_ratio=round(title_w, 3),
+        bottom_annotation_band_ratio=round(bottom_band, 3),
+        notes_block_height_ratio=round(notes_h, 3),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page-derived parameter scaling (feature-flagged)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PageMetrics:
+    page_width: int
+    page_height: int
+    page_aspect: float
+    edge_density: float
+    mean_saturation: float
+    text_coverage: float
+    ocr_box_count: int
+    seed_aspect: float | None = None
+    seed_area_ratio: float | None = None
+    seed_height_ratio: float | None = None
+
+
+def _page_text_coverage(ocr: OcrPageResult, page_shape: tuple[int, int]) -> float:
+    if not ocr.boxes:
+        return 0.0
+    ph, pw = page_shape
+    mask = np.zeros((ph, pw), dtype=np.uint8)
+    for box in ocr.boxes:
+        x0, y0, x1, y1 = box.bbox
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(pw, x1), min(ph, y1)
+        if x1 > x0 and y1 > y0:
+            mask[y0:y1, x0:x1] = 255
+    return float(mask.mean() / 255.0)
+
+
+def compute_page_metrics(
+    image_bgr: np.ndarray,
+    ocr: OcrPageResult | None,
+    *,
+    seed_bbox_xyxy: tuple[int, int, int, int] | None = None,
+) -> PageMetrics:
+    ph, pw = image_bgr.shape[:2]
+    page_area = max(ph * pw, 1)
+    seed_aspect = seed_area = seed_height = None
+    if seed_bbox_xyxy is not None:
+        x0, y0, x1, y1 = seed_bbox_xyxy
+        bw, bh = max(x1 - x0, 1), max(y1 - y0, 1)
+        seed_aspect = bw / bh
+        seed_area = (bw * bh) / page_area
+        seed_height = bh / max(ph, 1)
+
+    return PageMetrics(
+        page_width=pw,
+        page_height=ph,
+        page_aspect=pw / max(ph, 1),
+        edge_density=_edge_density(image_bgr),
+        mean_saturation=_mean_saturation(image_bgr),
+        text_coverage=_page_text_coverage(ocr, (ph, pw)) if ocr else 0.0,
+        ocr_box_count=len(ocr.boxes) if ocr else 0,
+        seed_aspect=seed_aspect,
+        seed_area_ratio=seed_area,
+        seed_height_ratio=seed_height,
+    )
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def scale_profile_config(
+    base: ProfileConfig,
+    metrics: PageMetrics,
+) -> tuple[ProfileConfig, dict[str, Any]]:
+    if not config.PAGE_DERIVED_SCALING_ENABLED:
+        return base, {"scaling": "disabled"}
+
+    m = metrics
+    summary: dict[str, Any] = {"scaling": "enabled"}
+
+    area_mult = 1.0
+    if m.text_coverage > 0.08:
+        area_mult *= 0.92
+    if m.ocr_box_count >= 25:
+        area_mult *= 0.90
+    if m.seed_area_ratio is not None and m.seed_area_ratio > 0.52:
+        area_mult *= 0.88
+    if base.crop_profile == CropProfile.CAD_WIDE and m.seed_height_ratio is not None:
+        if m.seed_height_ratio > 0.45 and m.seed_aspect is not None and m.seed_aspect >= 2.0:
+            area_mult *= 0.86
+    area_mult = _clamp(area_mult, 0.82, 1.02)
+    max_area = _clamp(
+        base.max_figure_output_area_ratio * area_mult,
+        base.max_figure_output_area_ratio * 0.82,
+        base.max_figure_output_area_ratio * 1.02,
+    )
+    summary["area_mult"] = round(area_mult, 3)
+
+    text_mult = 1.0
+    if m.text_coverage > 0.06:
+        text_mult *= 0.90
+    if m.ocr_box_count >= 20:
+        text_mult *= 0.92
+    if m.ocr_box_count < 8:
+        text_mult *= 1.10
+    text_mult = _clamp(text_mult, 0.78, 1.12)
+    max_text_overlap = _clamp(
+        base.primary_figure_max_text_overlap * text_mult,
+        0.08,
+        base.primary_figure_max_text_overlap * 1.12,
+    )
+
+    shrink_mult = 1.0
+    if m.text_coverage > 0.05:
+        shrink_mult *= 0.85
+    if m.ocr_box_count >= 18:
+        shrink_mult *= 0.90
+    shrink_mult = _clamp(shrink_mult, 0.70, 1.10)
+    text_shrink_target = _clamp(
+        base.text_shrink_target_overlap * shrink_mult,
+        0.04,
+        base.text_shrink_target_overlap * 1.08,
+    )
+    summary["text_mult"] = round(text_mult, 3)
+
+    tighten_retained = base.tighten_min_retained_area_frac
+    if base.crop_profile == CropProfile.CAD_WIDE and m.seed_aspect is not None and m.seed_aspect >= 2.5:
+        tighten_retained = _clamp(tighten_retained * 0.85, 0.30, tighten_retained)
+
+    scaled = replace(
+        base,
+        max_figure_output_area_ratio=round(max_area, 4),
+        primary_figure_max_text_overlap=round(max_text_overlap, 4),
+        text_shrink_target_overlap=round(text_shrink_target, 4),
+        tighten_min_retained_area_frac=round(tighten_retained, 3),
+    )
+    summary["effective_max_area"] = scaled.max_figure_output_area_ratio
+    return scaled, summary
+
+
+def resolve_effective_profile_config(
+    crop_profile: CropProfile,
+    image_bgr: np.ndarray,
+    ocr: OcrPageResult | None,
+    *,
+    seed_bbox_xyxy: tuple[int, int, int, int] | None = None,
+) -> tuple[ProfileConfig, PageMetrics, dict[str, Any]]:
+    base = get_profile_config(crop_profile)
+    base = apply_dynamic_layout_zones(base, ocr, image_bgr.shape[:2])
+    metrics = compute_page_metrics(image_bgr, ocr, seed_bbox_xyxy=seed_bbox_xyxy)
+    scaled, summary = scale_profile_config(base, metrics)
+    return scaled, metrics, summary
 
 
 def default_crop_profile(page_profile: str | object) -> CropProfile:
@@ -419,17 +708,6 @@ def resolve_profile_config(
     return get_profile_config(CropProfile.MIXED_DATASHEET)
 
 
-def _edge_density(image_bgr: np.ndarray) -> float:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    return float(np.count_nonzero(edges) / max(edges.size, 1))
-
-
-def _mean_saturation(image_bgr: np.ndarray) -> float:
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    return float(hsv[:, :, 1].mean())
-
-
 def resolve_crop_profile(
     page_profile: str | object,
     image_bgr: np.ndarray,
@@ -454,6 +732,17 @@ def resolve_crop_profile(
     ph, pw = image_bgr.shape[:2]
     page_aspect = pw / max(ph, 1)
     ocr_box_count = len(ocr.boxes) if ocr is not None else 0
+    edge_density = _edge_density(image_bgr)
+
+    # Rasterized PDF engineering sheets (dense labels, line art).
+    if is_pdf and detect_scanned_raster_page(
+        image_bgr, ocr, embedded_on_page=embedded_on_page
+    ):
+        return CropProfile.SCANNED_PDF
+
+    if is_pdf and ocr_box_count >= 12 and edge_density >= 0.010:
+        if base in (CropProfile.SIMPLE_RASTER, CropProfile.MIXED_DATASHEET):
+            base = CropProfile.BLUEPRINT_LARGE
 
     if page_count == 1 and suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
         if page_key == "simple_image" and ocr_box_count < 12:
@@ -469,8 +758,8 @@ def resolve_crop_profile(
 
         # Wide shallow side views (fuselage, long profiles) on landscape sheets.
         if (
-            page_aspect >= 1.2
-            and seed_aspect >= 2.2
+            page_aspect >= 1.15
+            and seed_aspect >= 2.0
             and base
             in (
                 CropProfile.BLUEPRINT_LARGE,
@@ -496,9 +785,7 @@ def resolve_crop_profile(
             return CropProfile.CAD_COMPACT
 
     if is_pdf and embedded_on_page > 0:
-        if _mean_saturation(image_bgr) < 15 and _edge_density(image_bgr) >= 0.006:
-            return CropProfile.SCANNED_PDF
-        return CropProfile.DIGITAL_PDF
+        return CropProfile.SCANNED_PDF
 
     if base == CropProfile.BLUEPRINT_LARGE and page_aspect >= 1.25:
         return CropProfile.BLUEPRINT_LARGE

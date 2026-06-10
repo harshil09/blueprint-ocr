@@ -136,9 +136,21 @@ def classify_page(
             return PageProfile.ENGINEERING_SHEET
         return PageProfile.DIGITAL_PDF
 
-    # Full CAD sheets with title block / notes (landscape, many OCR boxes).
     page_aspect = pw / max(ph, 1)
     ocr_box_count = len(ocr.boxes)
+
+    # Rasterized PDF engineering sheets (landing gear, avionics layouts, etc.).
+    if is_pdf and ocr_box_count >= 12 and edge_density >= 0.010:
+        return PageProfile.ENGINEERING_SHEET
+
+    # Full CAD sheets with title block / notes (landscape, many OCR boxes).
+    if (
+        page_aspect >= 1.15
+        and ocr_box_count >= 12
+        and edge_density >= 0.012
+    ):
+        return PageProfile.ENGINEERING_SHEET
+
     if (
         page_count == 1
         and page_aspect >= 1.15
@@ -151,7 +163,7 @@ def classify_page(
     if (
         page_count == 1
         and edge_density >= eng_pcfg.engineering_edge_density_min
-        and ocr_box_count < 12
+        and ocr_box_count < 8
     ):
         return PageProfile.SIMPLE_IMAGE
 

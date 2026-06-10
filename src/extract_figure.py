@@ -16,7 +16,12 @@ import numpy as np
 from src import config
 from src.logger import get_logger
 from src.ocr.ocr_engine import TextBox
-from src.profile_config import CropProfile, ProfileConfig, resolve_profile_config
+from src.profile_config import (
+    CropProfile,
+    ProfileConfig,
+    effective_max_figure_output_area,
+    resolve_profile_config,
+)
 from src.utils import bbox_iou, save_bgr
 
 log = get_logger(__name__)
@@ -280,19 +285,32 @@ def remove_page_border(binary: np.ndarray) -> np.ndarray:
     return binary
 
 
-def remove_title_block(binary: np.ndarray) -> np.ndarray:
+def remove_title_block(
+    binary: np.ndarray,
+    *,
+    profile_config: ProfileConfig | None = None,
+) -> np.ndarray:
     """Clear the full-width bottom annotation band (title block, LOFT, notes)."""
-    h, _w = binary.shape
-    band_h = int(h * config.BOTTOM_ANNOTATION_BAND_RATIO)
+    pcfg = profile_config or resolve_profile_config(None)
+    h, w = binary.shape
+    band_h = int(h * pcfg.bottom_annotation_band_ratio)
     binary = binary.copy()
     binary[h - band_h :, :] = 0
+    title_h = int(h * config.TITLE_BLOCK_HEIGHT_RATIO)
+    title_w = int(w * pcfg.title_block_width_ratio)
+    binary[h - title_h :, w - title_w :] = 0
     return binary
 
 
-def remove_notes_block(binary: np.ndarray) -> np.ndarray:
+def remove_notes_block(
+    binary: np.ndarray,
+    *,
+    profile_config: ProfileConfig | None = None,
+) -> np.ndarray:
+    pcfg = profile_config or resolve_profile_config(None)
     h, w = binary.shape
-    notes_h = int(h * config.NOTES_BLOCK_HEIGHT_RATIO)
-    notes_w = int(w * config.NOTES_BLOCK_WIDTH_RATIO)
+    notes_h = int(h * pcfg.notes_block_height_ratio)
+    notes_w = int(w * pcfg.notes_block_width_ratio)
     binary = binary.copy()
     binary[:notes_h, :notes_w] = 0
     return binary
@@ -665,16 +683,19 @@ def refine_selected_bbox(
 def find_main_drawing_bbox_via_projection(
     image_bgr: np.ndarray,
     text_boxes: list[TextBox] | None = None,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[int, int, int, int] | None:
     """
     Locate the main line-art region using row/column edge projections.
 
     Works well for hollow CAD drawings where connected components fragment.
     """
+    pcfg = _active_profile_config(None, profile_config)
     h, w = image_bgr.shape[:2]
     margin_x = int(w * config.BORDER_MARGIN_RATIO)
     margin_y = int(h * config.BORDER_MARGIN_RATIO)
-    max_bottom = int(h * config.DRAWING_ZONE_MAX_BOTTOM_RATIO)
+    max_bottom = int(h * pcfg.drawing_zone_max_bottom_ratio)
     right_limit = int(w * (1.0 - config.PAGE_MARGIN_RIGHT_RATIO))
 
     working = image_bgr
@@ -798,7 +819,7 @@ def is_valid_figure_crop(
 
     if area_ratio < min_area:
         return False
-    if area_ratio > pcfg.max_figure_output_area_ratio:
+    if area_ratio > effective_max_figure_output_area(pcfg):
         return False
     if aspect < pcfg.min_crop_aspect_ratio or aspect > max_aspect:
         return False
@@ -813,6 +834,343 @@ def is_valid_figure_crop(
         if density < pcfg.min_line_art_density:
             return False
     return True
+
+
+def figure_crop_reject_reason(
+    box: tuple[int, int, int, int],
+    page_shape: tuple[int, int],
+    profile: str | object | None = None,
+    *,
+    line_art_density: float | None = None,
+    profile_config: ProfileConfig | None = None,
+) -> str | None:
+    """Return rejection reason string, or None when the crop is valid."""
+    pcfg = _active_profile_config(profile, profile_config)
+    ph, pw = page_shape
+    x, y, bw, bh = box
+    if bw <= 0 or bh <= 0:
+        return "empty_box"
+
+    max_aspect, min_h_ratio, min_w_ratio, min_area = _crop_limit_values(
+        profile, profile_config=pcfg
+    )
+    area_ratio = (bw * bh) / max(ph * pw, 1)
+    aspect = bw / max(bh, 1)
+    height_ratio = bh / max(ph, 1)
+
+    if area_ratio < min_area:
+        return "area_too_small"
+    if area_ratio > effective_max_figure_output_area(pcfg):
+        return "area_too_large"
+    if aspect < pcfg.min_crop_aspect_ratio:
+        return "aspect_too_narrow"
+    if aspect > max_aspect:
+        return "aspect_too_wide"
+    if bw < pw * min_w_ratio:
+        return "width_too_small"
+    if height_ratio < min_h_ratio:
+        return "height_too_small"
+    if aspect > 4.0 and height_ratio < 0.22:
+        density = line_art_density if line_art_density is not None else 0.0
+        if density < pcfg.min_line_art_density:
+            return "line_art_too_sparse"
+    return None
+
+
+def _shrink_xyxy_to_max_area(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    page_shape: tuple[int, int],
+    max_area_ratio: float,
+) -> tuple[int, int, int, int]:
+    """Symmetrically shrink an xyxy bbox so area <= max_area_ratio of the page."""
+    ph, pw = page_shape
+    max_area = int(ph * pw * max_area_ratio)
+    width = max(x2 - x1, 1)
+    height = max(y2 - y1, 1)
+    if width * height <= max_area:
+        return x1, y1, x2, y2
+
+    scale = (max_area / (width * height)) ** 0.5
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    half_w = max(5, int(width * scale / 2))
+    half_h = max(5, int(height * scale / 2))
+    margin_x = int(pw * config.BORDER_MARGIN_RATIO)
+    margin_y = int(ph * config.BORDER_MARGIN_RATIO)
+    nx1 = max(margin_x, int(cx - half_w))
+    ny1 = max(margin_y, int(cy - half_h))
+    nx2 = min(pw - margin_x, int(cx + half_w))
+    ny2 = min(ph - margin_y, int(cy + half_h))
+    if nx2 <= nx1 + 5 or ny2 <= ny1 + 5:
+        return x1, y1, x2, y2
+    return nx1, ny1, nx2, ny2
+
+
+def _trim_region_by_line_art_projection(
+    mask: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    *,
+    profile_config: ProfileConfig | None = None,
+) -> tuple[int, int, int, int]:
+    """Find a tighter xyxy box via row/column ink projection inside a region."""
+    pcfg = _active_profile_config(None, profile_config)
+    roi = mask[y1:y2, x1:x2]
+    rh, rw = roi.shape[:2]
+    if rh < 20 or rw < 20:
+        return x1, y1, x2, y2
+
+    bottom_cut = int(rh * pcfg.bottom_annotation_band_ratio)
+    right_cut = int(rw * pcfg.title_block_width_ratio)
+    work = roi.copy()
+    if bottom_cut > 0:
+        work[rh - bottom_cut :, :] = 0
+    if right_cut > 0:
+        work[:, rw - right_cut :] = 0
+
+    row_sum = work.sum(axis=1).astype(np.float32)
+    col_sum = work.sum(axis=0).astype(np.float32)
+    if row_sum.max() < 4 or col_sum.max() < 4:
+        return x1, y1, x2, y2
+
+    row_thresh = max(row_sum.max() * 0.04, 6.0)
+    col_thresh = max(col_sum.max() * 0.04, 6.0)
+    rows = np.where(row_sum >= row_thresh)[0]
+    cols = np.where(col_sum >= col_thresh)[0]
+    if len(rows) < 4 or len(cols) < 4:
+        return x1, y1, x2, y2
+
+    ty1 = y1 + int(rows[0])
+    ty2 = y1 + int(rows[-1]) + 1
+    tx1 = x1 + int(cols[0])
+    tx2 = x1 + int(cols[-1]) + 1
+    return tx1, ty1, tx2, ty2
+
+
+def _tight_bbox_to_line_art_region(
+    image_bgr: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    text_boxes: list[TextBox] | None,
+    *,
+    profile_config: ProfileConfig | None = None,
+    min_pixels: int = 24,
+) -> tuple[int, int, int, int]:
+    """Tighten xyxy bounds to line-art ink inside the given region."""
+    h, w = image_bgr.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 + 5 or y2 <= y1 + 5:
+        return x1, y1, x2, y2
+
+    mask = build_line_art_mask(image_bgr, text_boxes, profile_config=profile_config)
+    roi = mask[y1:y2, x1:x2]
+    if roi.size == 0 or np.count_nonzero(roi) < min_pixels:
+        return x1, y1, x2, y2
+
+    rows = np.where(roi.max(axis=1) > 0)[0]
+    cols = np.where(roi.max(axis=0) > 0)[0]
+    if len(rows) < 2 or len(cols) < 2:
+        return x1, y1, x2, y2
+
+    pcfg = _active_profile_config(None, profile_config)
+    pad_x = max(pcfg.line_art_tighten_min_margin_px, int((x2 - x1) * 0.02))
+    pad_y = max(pcfg.line_art_tighten_min_margin_px, int((y2 - y1) * 0.02))
+    ty1 = y1 + int(rows[0])
+    ty2 = y1 + int(rows[-1]) + 1
+    tx1 = x1 + int(cols[0])
+    tx2 = x1 + int(cols[-1]) + 1
+    return (
+        max(0, tx1 - pad_x),
+        max(0, ty1 - pad_y),
+        min(w, tx2 + pad_x),
+        min(h, ty2 + pad_y),
+    )
+
+
+def compute_drawing_zone_bbox(
+    image_bgr: np.ndarray,
+    morph_box: tuple[int, int, int, int] | None,
+    proj_box: tuple[int, int, int, int] | None,
+    text_boxes: list[TextBox] | None,
+    *,
+    profile: str | object | None = None,
+    profile_config: ProfileConfig | None = None,
+) -> tuple[tuple[int, int, int, int] | None, str]:
+    """
+    Resolve a drawing-zone bbox when morphology finds a fragment and projection
+    finds the full sheet. Trims projection to line-art ink instead of taking 60%+.
+    """
+    page_shape = image_bgr.shape[:2]
+    pcfg = _active_profile_config(profile, profile_config)
+
+    morph_area = (
+        _box_area_ratio(morph_box, page_shape) if morph_box is not None else 0.0
+    )
+    proj_area = (
+        _box_area_ratio(proj_box, page_shape) if proj_box is not None else 0.0
+    )
+
+    fragment = morph_box is not None and morph_area <= config.MORPHOLOGY_FRAGMENT_AREA_MAX
+    oversize = proj_box is not None and proj_area >= config.PROJECTION_OVERSIZE_AREA_MIN
+
+    if fragment and oversize and proj_box is not None:
+        px1, py1, px2, py2 = _box_xywh_to_xyxy(proj_box)
+        line_mask = build_line_art_mask(image_bgr, text_boxes, profile_config=pcfg)
+        tx1, ty1, tx2, ty2 = _trim_region_by_line_art_projection(
+            line_mask, px1, py1, px2, py2, profile_config=pcfg
+        )
+        proj_trim_area = (tx2 - tx1) * (ty2 - ty1) / max(page_shape[0] * page_shape[1], 1)
+        if proj_trim_area > config.DRAWING_ZONE_TARGET_AREA_MAX:
+            tx1, ty1, tx2, ty2 = _tight_bbox_to_line_art_region(
+                image_bgr, tx1, ty1, tx2, ty2, text_boxes, profile_config=pcfg
+            )
+
+        if morph_box is not None:
+            mx1, my1, mx2, my2 = _box_xywh_to_xyxy(morph_box)
+            tx1 = min(tx1, mx1)
+            ty1 = min(ty1, my1)
+            tx2 = max(tx2, mx2)
+            ty2 = max(ty2, my2)
+
+        tx1, ty1, tx2, ty2 = shrink_bbox_from_text_overlap(
+            image_bgr, tx1, ty1, tx2, ty2, text_boxes, profile_config=pcfg
+        )
+        max_area = effective_max_figure_output_area(pcfg)
+        tx1, ty1, tx2, ty2 = _shrink_xyxy_to_max_area(
+            tx1, ty1, tx2, ty2, page_shape, max_area
+        )
+        trimmed = _box_xyxy_to_xywh((tx1, ty1, tx2, ty2))
+        trimmed_area = _box_area_ratio(trimmed, page_shape)
+        if trimmed_area >= config.DRAWING_ZONE_TARGET_AREA_MIN:
+            log.info(
+                "Drawing-zone merge: morphology %.1f%% + projection %.1f%% -> trimmed %.1f%%",
+                100 * morph_area,
+                100 * proj_area,
+                100 * trimmed_area,
+            )
+            return trimmed, "drawing_zone"
+
+    if proj_box is not None and proj_area >= config.PROJECTION_OVERSIZE_AREA_MIN:
+        px1, py1, px2, py2 = _box_xywh_to_xyxy(proj_box)
+        line_mask = build_line_art_mask(image_bgr, text_boxes, profile_config=pcfg)
+        tx1, ty1, tx2, ty2 = _trim_region_by_line_art_projection(
+            line_mask, px1, py1, px2, py2, profile_config=pcfg
+        )
+        if (tx2 - tx1) * (ty2 - ty1) / max(page_shape[0] * page_shape[1], 1) > config.DRAWING_ZONE_TARGET_AREA_MAX:
+            tx1, ty1, tx2, ty2 = _tight_bbox_to_line_art_region(
+                image_bgr, tx1, ty1, tx2, ty2, text_boxes, profile_config=pcfg
+            )
+        tx1, ty1, tx2, ty2 = shrink_bbox_from_text_overlap(
+            image_bgr, tx1, ty1, tx2, ty2, text_boxes, profile_config=pcfg
+        )
+        max_area = effective_max_figure_output_area(pcfg)
+        tx1, ty1, tx2, ty2 = _shrink_xyxy_to_max_area(
+            tx1, ty1, tx2, ty2, page_shape, max_area
+        )
+        trimmed = _box_xyxy_to_xywh((tx1, ty1, tx2, ty2))
+        if _box_area_ratio(trimmed, page_shape) >= pcfg.min_crop_area_ratio:
+            return trimmed, "projection_trimmed"
+
+    if morph_box is not None:
+        return morph_box, "morphology"
+    if proj_box is not None:
+        return proj_box, "projection"
+    return None, "none"
+
+
+def _attempt_crop_recovery(
+    image_bgr: np.ndarray,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    text_boxes: list[TextBox] | None,
+    profile: str | object | None,
+    *,
+    profile_config: ProfileConfig | None = None,
+    max_recovery_area_ratio: float | None = None,
+    forbid_area_expansion: bool = False,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """
+    When validation fails, progressively tighten the bbox instead of dropping it.
+    """
+    pcfg = _active_profile_config(profile, profile_config)
+    page_shape = image_bgr.shape[:2]
+    page_area = max(page_shape[0] * page_shape[1], 1)
+    seed_area_ratio = (x2 - x1) * (y2 - y1) / page_area
+    area_limit = (
+        max_recovery_area_ratio
+        if max_recovery_area_ratio is not None
+        else effective_max_figure_output_area(pcfg)
+    )
+    reject_reason = figure_crop_reject_reason(
+        (x1, y1, x2 - x1, y2 - y1),
+        page_shape,
+        profile,
+        profile_config=pcfg,
+    )
+    reject_was_oversize = reject_reason == "area_too_large"
+    attempts: list[tuple[int, int, int, int]] = []
+
+    sx1, sy1, sx2, sy2 = shrink_bbox_from_text_overlap(
+        image_bgr, x1, y1, x2, y2, text_boxes, profile_config=pcfg
+    )
+    attempts.append((sx1, sy1, sx2, sy2))
+
+    tx1, ty1, tx2, ty2 = tighten_bbox_to_line_art(
+        image_bgr, x1, y1, x2, y2, text_boxes, profile_config=pcfg
+    )
+    attempts.append((tx1, ty1, tx2, ty2))
+
+    rx1, ry1, rx2, ry2 = refine_figure_crop_bounds(
+        image_bgr, x1, y1, x2, y2, text_boxes, profile=profile, profile_config=pcfg
+    )
+    attempts.append((rx1, ry1, rx2, ry2))
+
+    mx1, my1, mx2, my2 = _shrink_xyxy_to_max_area(
+        x1, y1, x2, y2, page_shape, area_limit
+    )
+    attempts.append((mx1, my1, mx2, my2))
+
+    combined = _tight_bbox_to_line_art_region(
+        image_bgr, mx1, my1, mx2, my2, text_boxes, profile_config=pcfg
+    )
+    csx1, csy1, csx2, csy2 = shrink_bbox_from_text_overlap(
+        image_bgr, *combined, text_boxes, profile_config=pcfg
+    )
+    attempts.append((csx1, csy1, csx2, csy2))
+
+    seen: set[tuple[int, int, int, int]] = set()
+    for ax1, ay1, ax2, ay2 in attempts:
+        key = (ax1, ay1, ax2, ay2)
+        if key in seen or ax2 <= ax1 + 5 or ay2 <= ay1 + 5:
+            continue
+        seen.add(key)
+        result = _validate_and_crop(
+            image_bgr, ax1, ay1, ax2, ay2, text_boxes, profile, profile_config=pcfg
+        )
+        if result is not None:
+            area = (ax2 - ax1) * (ay2 - ay1) / page_area
+            if area > area_limit + 1e-6:
+                continue
+            if forbid_area_expansion or reject_was_oversize:
+                if area > seed_area_ratio * 1.02:
+                    continue
+            log.info(
+                "Crop recovered after validation reject (area %.1f%% of page)",
+                100 * area,
+            )
+            return result
+
+    return None
 
 
 def _bbox_quality_score(
@@ -862,34 +1220,87 @@ def select_best_drawing_box(
     image_bgr: np.ndarray,
     morphology_selection: FigureSelectionResult | None,
     text_boxes: list[TextBox] | None,
+    *,
+    profile: str | object | None = None,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[tuple[int, int, int, int] | None, str]:
     """Pick the best bbox between morphology connected-components and edge projection."""
     page_shape = image_bgr.shape[:2]
+    pcfg = _active_profile_config(profile, profile_config)
     candidates: list[tuple[tuple[int, int, int, int], str, float]] = []
 
-    proj_box = find_main_drawing_bbox_via_projection(image_bgr, text_boxes)
-    if proj_box is not None and is_valid_figure_crop(proj_box, page_shape):
-        candidates.append(
-            (proj_box, "projection", _bbox_quality_score(proj_box, page_shape, source="projection"))
-        )
+    morph_box = morphology_selection.box if morphology_selection is not None else None
+    proj_box = find_main_drawing_bbox_via_projection(
+        image_bgr, text_boxes, profile_config=pcfg
+    )
 
-    if morphology_selection is not None:
-        morph_box = morphology_selection.box
-        if is_valid_figure_crop(morph_box, page_shape):
-            if proj_box is not None and _should_prefer_projection_over_morphology(
-                morph_box, proj_box, page_shape
-            ):
+    merged_box, merged_source = compute_drawing_zone_bbox(
+        image_bgr,
+        morph_box,
+        proj_box,
+        text_boxes,
+        profile=profile,
+        profile_config=pcfg,
+    )
+    if merged_box is not None and merged_source in ("drawing_zone", "projection_trimmed"):
+        density = line_art_density_in_bbox(
+            image_bgr,
+            _box_xywh_to_xyxy(merged_box),
+            text_boxes,
+            profile_config=pcfg,
+        )
+        if is_valid_figure_crop(
+            merged_box,
+            page_shape,
+            profile,
+            line_art_density=density,
+            profile_config=pcfg,
+        ):
+            score = _bbox_quality_score(merged_box, page_shape, source=merged_source)
+            candidates.append((merged_box, merged_source, score))
+        elif merged_source == "drawing_zone":
+            log.debug("Drawing-zone bbox failed validation; trying raw candidates")
+
+    if proj_box is not None and is_valid_figure_crop(
+        proj_box, page_shape, profile, profile_config=pcfg
+    ):
+        if not any(c[1] in ("drawing_zone", "projection_trimmed") for c in candidates):
+            candidates.append(
+                (
+                    proj_box,
+                    "projection",
+                    _bbox_quality_score(proj_box, page_shape, source="projection"),
+                )
+            )
+
+    if morph_box is not None and is_valid_figure_crop(
+        morph_box, page_shape, profile, profile_config=pcfg
+    ):
+        if proj_box is not None and _should_prefer_projection_over_morphology(
+            morph_box, proj_box, page_shape
+        ):
+            if not any(c[1] in ("drawing_zone", "projection_trimmed", "projection") for c in candidates):
                 log.info(
                     "Using projection bbox (morphology fragment: area %.1f%% vs projection %.1f%%)",
                     100 * morph_box[2] * morph_box[3] / (page_shape[0] * page_shape[1]),
                     100 * proj_box[2] * proj_box[3] / (page_shape[0] * page_shape[1]),
                 )
-            else:
-                score = _bbox_quality_score(morph_box, page_shape, source="morphology")
+                candidates.append(
+                    (
+                        proj_box,
+                        "projection",
+                        _bbox_quality_score(proj_box, page_shape, source="projection"),
+                    )
+                )
+        elif not any(c[0] == morph_box for c in candidates):
+            score = _bbox_quality_score(morph_box, page_shape, source="morphology")
+            if morphology_selection is not None:
                 score *= morphology_selection.gate_score
-                candidates.append((morph_box, "morphology", score))
-        elif proj_box is None:
-            log.debug("Morphology bbox failed validation and no projection fallback")
+            candidates.append((morph_box, "morphology", score))
+
+    if not candidates and merged_box is not None:
+        log.debug("Using merged bbox without strict validation (%s)", merged_source)
+        return merged_box, merged_source
 
     if not candidates and proj_box is not None:
         log.debug("Using projection bbox without strict size validation")
@@ -1282,13 +1693,14 @@ def _validate_and_crop(
     density = line_art_density_in_bbox(
         image_bgr, (x1, y1, x2, y2), text_boxes, profile_config=pcfg
     )
-    if not is_valid_figure_crop(
+    reason = figure_crop_reject_reason(
         final_box,
         image_bgr.shape[:2],
         profile,
         line_art_density=density,
         profile_config=pcfg,
-    ):
+    )
+    if reason is not None:
         return None
     return image_bgr[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
 
@@ -1323,6 +1735,9 @@ def prepare_primary_crop(
     profile: str | object | None = None,
     *,
     profile_config: ProfileConfig | None = None,
+    allow_recovery: bool = True,
+    max_recovery_area_ratio: float | None = None,
+    forbid_area_expansion: bool = False,
 ) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
     """
     Refine bbox, validate with profile limits, return crop and xyxy bbox.
@@ -1331,6 +1746,11 @@ def prepare_primary_crop(
     if x2 <= x1 or y2 <= y1:
         return None
 
+    area_limit = (
+        max_recovery_area_ratio
+        if max_recovery_area_ratio is not None
+        else effective_max_figure_output_area(pcfg)
+    )
     seed = (x1, y1, x2, y2)
     rx1, ry1, rx2, ry2 = refine_figure_crop_bounds(
         image_bgr,
@@ -1348,7 +1768,23 @@ def prepare_primary_crop(
     if result is not None:
         return result
 
-    # Fallback: text-shrink seed only (avoid failed tighten on photo-heavy PDFs).
+    if allow_recovery:
+        recovered = _attempt_crop_recovery(
+            image_bgr,
+            seed[0],
+            seed[1],
+            seed[2],
+            seed[3],
+            text_boxes,
+            profile,
+            profile_config=pcfg,
+            max_recovery_area_ratio=area_limit,
+            forbid_area_expansion=forbid_area_expansion,
+        )
+        if recovered is not None:
+            return recovered
+
+    # Last resort: text-shrink seed only (avoid failed tighten on photo-heavy PDFs).
     sx1, sy1, sx2, sy2 = shrink_bbox_from_text_overlap(
         image_bgr,
         seed[0],
@@ -1358,8 +1794,26 @@ def prepare_primary_crop(
         text_boxes,
         profile_config=pcfg,
     )
-    return _validate_and_crop(
+    result = _validate_and_crop(
         image_bgr, sx1, sy1, sx2, sy2, text_boxes, profile, profile_config=pcfg
+    )
+    if result is not None:
+        return result
+
+    if not allow_recovery:
+        return None
+
+    return _attempt_crop_recovery(
+        image_bgr,
+        sx1,
+        sy1,
+        sx2,
+        sy2,
+        text_boxes,
+        profile,
+        profile_config=pcfg,
+        max_recovery_area_ratio=area_limit,
+        forbid_area_expansion=forbid_area_expansion,
     )
 
 
@@ -1488,9 +1942,12 @@ def _fit_crop_to_max_area(
     y2: int,
     page_h: int,
     page_w: int,
+    *,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[int, int, int, int]:
-    """Shrink crop symmetrically if it exceeds MAX_FIGURE_OUTPUT_AREA_RATIO."""
-    max_area = int(page_h * page_w * config.MAX_FIGURE_OUTPUT_AREA_RATIO)
+    """Shrink crop symmetrically if it exceeds the profile max area ratio."""
+    pcfg = _active_profile_config(None, profile_config)
+    max_area = int(page_h * page_w * effective_max_figure_output_area(pcfg))
     width = max(x2 - x1, 1)
     height = y2 - y1
     if width * height <= max_area:
@@ -1533,6 +1990,7 @@ def _prepare_binary_and_candidates(
     text_boxes: list[TextBox] | None,
     *,
     apply_text_mask: bool,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[int, int, list[ComponentCandidate], FigureSelectionResult | None]:
     page_h, page_w = image.shape[:2]
     scale = _morphology_analysis_scale(page_h, page_w)
@@ -1566,8 +2024,8 @@ def _prepare_binary_and_candidates(
     h, w = gray.shape
     binary = adaptive_binarize(gray)
     binary = remove_page_border(binary)
-    binary = remove_notes_block(binary)
-    binary = remove_title_block(binary)
+    binary = remove_notes_block(binary, profile_config=profile_config)
+    binary = remove_title_block(binary, profile_config=profile_config)
     binary = apply_morphology_close(binary)
 
     raw = find_top_component_candidates(binary)
@@ -1597,6 +2055,8 @@ def compute_engineering_figure_crop(
     text_boxes: list[TextBox] | None = None,
     *,
     apply_text_mask: bool = True,
+    profile: str | object | None = None,
+    profile_config: ProfileConfig | None = None,
 ) -> tuple[np.ndarray, tuple[int, int, int, int], FigureSelectionResult] | None:
     """
     Run the morphology/projection pipeline and return the crop in memory.
@@ -1606,11 +2066,21 @@ def compute_engineering_figure_crop(
     if image is None:
         raise ValueError("Input image is None")
 
+    pcfg = _active_profile_config(profile, profile_config)
     h, w, _candidates, selection = _prepare_binary_and_candidates(
-        image, text_boxes, apply_text_mask=apply_text_mask
+        image,
+        text_boxes,
+        apply_text_mask=apply_text_mask,
+        profile_config=pcfg,
     )
 
-    best_box, _source = select_best_drawing_box(image, selection, text_boxes)
+    best_box, _source = select_best_drawing_box(
+        image,
+        selection,
+        text_boxes,
+        profile=profile,
+        profile_config=pcfg,
+    )
     if best_box is None:
         return None
 
@@ -1636,49 +2106,118 @@ def compute_engineering_figure_crop(
     x1, y1, x2, y2 = _compute_final_crop_bounds(selection.box, h, w)
     y1 = _expand_crop_toward_drawing_top(image, x1, y1, x2, y2)
     x1, y1, x2, y2 = finalize_crop_bounds(image, x1, y1, x2, y2, text_boxes)
-    x1, y1, x2, y2 = _fit_crop_to_max_area(x1, y1, x2, y2, h, w)
+    x1, y1, x2, y2 = _fit_crop_to_max_area(
+        x1, y1, x2, y2, h, w, profile_config=pcfg
+    )
     if y2 <= y1 + 10:
         return None
 
+    active_profile = profile if profile is not None else "engineering_sheet"
     prepared = prepare_primary_crop(
-        image, x1, y1, x2, y2, text_boxes, profile="engineering_sheet"
+        image,
+        x1,
+        y1,
+        x2,
+        y2,
+        text_boxes,
+        profile=active_profile,
+        profile_config=pcfg,
     )
     crop_area_ratio = (x2 - x1) * (y2 - y1) / max(h * w, 1)
-    if prepared is None or crop_area_ratio > config.MAX_FIGURE_OUTPUT_AREA_RATIO * 0.88:
-        proj_box = find_main_drawing_bbox_via_projection(image, text_boxes)
-        if proj_box is not None:
-            px1, py1, px2, py2 = _pad_detection_bbox_xyxy(proj_box, (h, w))
+    max_area = effective_max_figure_output_area(pcfg)
+    if prepared is None or crop_area_ratio > max_area * 0.88:
+        morph_seed = selection.box if selection is not None else None
+        proj_box = find_main_drawing_bbox_via_projection(
+            image, text_boxes, profile_config=pcfg
+        )
+        zone_box, zone_source = compute_drawing_zone_bbox(
+            image,
+            morph_seed,
+            proj_box,
+            text_boxes,
+            profile=active_profile,
+            profile_config=pcfg,
+        )
+        if zone_box is not None:
+            zx1, zy1, zx2, zy2 = _pad_detection_bbox_xyxy(zone_box, (h, w))
+            zone_tight = zone_source in ("drawing_zone", "projection_trimmed")
             alt = prepare_primary_crop(
-                image, px1, py1, px2, py2, text_boxes, profile="engineering_sheet"
+                image,
+                zx1,
+                zy1,
+                zx2,
+                zy2,
+                text_boxes,
+                profile=active_profile,
+                profile_config=pcfg,
+                allow_recovery=not zone_tight,
+                forbid_area_expansion=zone_tight,
+                max_recovery_area_ratio=max_area,
             )
             if alt is not None:
                 alt_area = (alt[1][2] - alt[1][0]) * (alt[1][3] - alt[1][1]) / max(h * w, 1)
-                if prepared is None or alt_area < crop_area_ratio * 0.85:
+                prefer_zone = (
+                    prepared is None
+                    or alt_area < crop_area_ratio * 0.92
+                    or (zone_tight and crop_area_ratio > max_area)
+                )
+                if prefer_zone and alt_area <= max_area + 1e-6:
                     prepared = alt
                     log.info(
-                        "Using tighter projection crop (%.1f%% vs morphology %.1f%% of page)",
+                        "Using %s crop (%.1f%% vs morphology %.1f%% of page)",
+                        zone_source,
                         100 * alt_area,
                         100 * crop_area_ratio,
                     )
 
     if prepared is None:
-        final_box = (x1, y1, x2 - x1, y2 - y1)
-        log.info(
-            "Engineering figure crop rejected (invalid geometry %dx%d, %.1f%% of page)",
-            final_box[2],
-            final_box[3],
-            100.0 * final_box[2] * final_box[3] / (h * w),
+        recovered = _attempt_crop_recovery(
+            image,
+            x1,
+            y1,
+            x2,
+            y2,
+            text_boxes,
+            active_profile,
+            profile_config=pcfg,
+            max_recovery_area_ratio=max_area,
         )
-        return None
+        if recovered is not None:
+            prepared = recovered
+        else:
+            final_box = (x1, y1, x2 - x1, y2 - y1)
+            log.info(
+                "Engineering figure crop rejected (invalid geometry %dx%d, %.1f%% of page)",
+                final_box[2],
+                final_box[3],
+                100.0 * final_box[2] * final_box[3] / (h * w),
+            )
+            return None
 
     cropped, (x1, y1, x2, y2) = prepared
     crop_area = (x2 - x1) * (y2 - y1)
-    if crop_area / max(h * w, 1) > config.MAX_FIGURE_OUTPUT_AREA_RATIO:
-        log.info(
-            "Engineering figure crop too large (%.1f%% of page); skipping",
-            100.0 * crop_area / (h * w),
+    if crop_area / max(h * w, 1) > max_area:
+        sx1, sy1, sx2, sy2 = _shrink_xyxy_to_max_area(
+            x1, y1, x2, y2, (h, w), max_area
         )
-        return None
+        recovered = _validate_and_crop(
+            image,
+            sx1,
+            sy1,
+            sx2,
+            sy2,
+            text_boxes,
+            active_profile,
+            profile_config=pcfg,
+        )
+        if recovered is not None:
+            cropped, (x1, y1, x2, y2) = recovered
+        else:
+            log.info(
+                "Engineering figure crop too large (%.1f%% of page); skipping",
+                100.0 * crop_area / (h * w),
+            )
+            return None
 
     return cropped, (x1, y1, x2, y2), selection
 

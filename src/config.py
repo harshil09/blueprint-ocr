@@ -15,6 +15,26 @@ PROFILE_CONFIG_LOG_FILE = (
     Path(__file__).resolve().parent.parent / "logs" / "profile_config.log"
 )
 
+# Adapt ProfileConfig thresholds per page from ink/text/geometry metrics.
+# Keep disabled until tighten-on-reject is verified on the eval set.
+PAGE_DERIVED_SCALING_ENABLED = False
+
+# Target area band for drawing-zone merger (morphology fragment vs projection sheet).
+DRAWING_ZONE_TARGET_AREA_MIN = 0.22
+DRAWING_ZONE_TARGET_AREA_MAX = 0.48
+MORPHOLOGY_FRAGMENT_AREA_MAX = 0.30
+PROJECTION_OVERSIZE_AREA_MIN = 0.50
+
+# Stricter output ceiling for cad_wide (wide side views, fuselage profiles).
+CAD_WIDE_MAX_OUTPUT_AREA_RATIO = 0.40
+
+# Heuristics for scanned-raster PDF detection (see profile_config.detect_scanned_raster_page).
+SCANNED_PAGE_MIN_SIDE_PX = 1800
+SCANNED_PAGE_SATURATION_MAX = 22.0
+SCANNED_PAGE_MIN_EDGE_DENSITY = 0.006
+SCANNED_PAGE_MAX_EDGE_DENSITY = 0.14
+SCANNED_PAGE_MIN_LAPLACIAN_VAR = 45.0
+
 # ---------------------------------------------------------------------------
 # OCR
 # ---------------------------------------------------------------------------
