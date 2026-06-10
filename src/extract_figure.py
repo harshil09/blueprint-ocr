@@ -1490,7 +1490,7 @@ def tighten_bbox_to_line_art(
     aspect = bw / max(bh, 1)
     seed_area = bw * bh
     seed = (x1, y1, x2, y2)
-    max_area = int(h * w * pcfg.max_figure_output_area_ratio)
+    max_area = int(h * w * effective_max_figure_output_area(pcfg))
 
     seed_mask = mask[y1:y2, x1:x2]
     if seed_mask.size == 0 or np.count_nonzero(seed_mask) < 24:

@@ -20,6 +20,7 @@ import numpy as np
 from src import config
 from src.logger import get_logger
 from src.ocr.ocr_engine import OcrPageResult
+from src.utils.image_metrics import page_edge_density, page_mean_saturation
 
 log = get_logger(__name__)
 _PROFILE_FILE_HANDLER_ATTACHED = False
@@ -395,6 +396,16 @@ def get_profile_config(crop_profile: CropProfile) -> ProfileConfig:
     return PROFILE_TABLE[crop_profile]
 
 
+def is_full_page_embedded_pdf(*, embedded_on_page: int, is_pdf: bool) -> bool:
+    """
+    True when a PDF page has at least one full-page embedded raster.
+
+    ``embedded_on_page`` must come from :func:`embedded_image_counts_by_page`
+    with ``full_page_only=True`` (the default).
+    """
+    return is_pdf and embedded_on_page > 0
+
+
 def effective_max_figure_output_area(pcfg: ProfileConfig) -> float:
     """Profile max area with cad_wide product cap applied."""
     if pcfg.crop_profile == CropProfile.CAD_WIDE:
@@ -422,8 +433,8 @@ def detect_scanned_raster_page(
     if min_side < config.SCANNED_PAGE_MIN_SIDE_PX:
         return False
 
-    saturation = _mean_saturation(image_bgr)
-    edge_density = _edge_density(image_bgr)
+    saturation = page_mean_saturation(image_bgr)
+    edge_density = page_edge_density(image_bgr)
     if saturation > config.SCANNED_PAGE_SATURATION_MAX:
         return False
     if edge_density < config.SCANNED_PAGE_MIN_EDGE_DENSITY:
@@ -446,17 +457,6 @@ def detect_scanned_raster_page(
     if page_area >= 12_000_000 and saturation < 16.0 and edge_density >= 0.007:
         return True
     return False
-
-
-def _edge_density(image_bgr: np.ndarray) -> float:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    return float(np.count_nonzero(edges) / max(edges.size, 1))
-
-
-def _mean_saturation(image_bgr: np.ndarray) -> float:
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    return float(hsv[:, :, 1].mean())
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +576,8 @@ def compute_page_metrics(
         page_width=pw,
         page_height=ph,
         page_aspect=pw / max(ph, 1),
-        edge_density=_edge_density(image_bgr),
-        mean_saturation=_mean_saturation(image_bgr),
+        edge_density=page_edge_density(image_bgr),
+        mean_saturation=page_mean_saturation(image_bgr),
         text_coverage=_page_text_coverage(ocr, (ph, pw)) if ocr else 0.0,
         ocr_box_count=len(ocr.boxes) if ocr else 0,
         seed_aspect=seed_aspect,
@@ -721,6 +721,9 @@ def resolve_crop_profile(
 ) -> CropProfile:
     """
     Refine page profile into a crop profile using page metrics and optional seed bbox.
+
+    ``embedded_on_page`` is the full-page embedded image count from
+    ``embedded_image_counts_by_page(..., full_page_only=True)``.
     """
     page_key = page_profile.value if hasattr(page_profile, "value") else str(page_profile)
     base = default_crop_profile(page_profile)
@@ -732,7 +735,11 @@ def resolve_crop_profile(
     ph, pw = image_bgr.shape[:2]
     page_aspect = pw / max(ph, 1)
     ocr_box_count = len(ocr.boxes) if ocr is not None else 0
-    edge_density = _edge_density(image_bgr)
+    edge_density = page_edge_density(image_bgr)
+
+    # Full-page embedded raster on PDF → scanned crop profile.
+    if is_full_page_embedded_pdf(embedded_on_page=embedded_on_page, is_pdf=is_pdf):
+        return CropProfile.SCANNED_PDF
 
     # Rasterized PDF engineering sheets (dense labels, line art).
     if is_pdf and detect_scanned_raster_page(
@@ -783,9 +790,6 @@ def resolve_crop_profile(
             return CropProfile.CAD_WIDE
         if seed_aspect <= 0.55 and height_ratio >= 0.35:
             return CropProfile.CAD_COMPACT
-
-    if is_pdf and embedded_on_page > 0:
-        return CropProfile.SCANNED_PDF
 
     if base == CropProfile.BLUEPRINT_LARGE and page_aspect >= 1.25:
         return CropProfile.BLUEPRINT_LARGE

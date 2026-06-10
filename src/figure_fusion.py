@@ -22,10 +22,12 @@ from src.profile_config import (
     ProfileConfig,
     default_crop_profile,
     get_profile_config,
+    is_full_page_embedded_pdf,
     resolve_crop_profile,
     resolve_profile_config,
 )
 from src.utils import bbox_iou
+from src.utils.image_metrics import page_edge_density, page_mean_saturation
 
 log = get_logger(__name__)
 
@@ -100,17 +102,6 @@ def _page_text_coverage(ocr: OcrPageResult, page_shape: tuple[int, int]) -> floa
     return float(mask.mean() / 255.0)
 
 
-def _edge_density(image_bgr: np.ndarray) -> float:
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    return float(np.count_nonzero(edges) / max(edges.size, 1))
-
-
-def _mean_saturation(image_bgr: np.ndarray) -> float:
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    return float(hsv[:, :, 1].mean())
-
-
 def classify_page(
     image_bgr: np.ndarray,
     ocr: OcrPageResult,
@@ -119,22 +110,26 @@ def classify_page(
     embedded_on_page: int = 0,
     is_pdf: bool = False,
 ) -> PageProfile:
+    """
+    Classify page type for fusion priors.
+
+    ``embedded_on_page`` is the full-page embedded image count from
+    ``embedded_image_counts_by_page(..., full_page_only=True)``.
+    """
     ph, pw = image_bgr.shape[:2]
     text_heavy_pcfg = get_profile_config(CropProfile.TEXT_HEAVY)
     eng_pcfg = get_profile_config(CropProfile.BLUEPRINT_LARGE)
 
     text_cov = _page_text_coverage(ocr, (ph, pw))
-    if text_cov >= text_heavy_pcfg.page_text_heavy_coverage_ratio and _edge_density(image_bgr) < 0.015:
+    if text_cov >= text_heavy_pcfg.page_text_heavy_coverage_ratio and page_edge_density(image_bgr) < 0.015:
         return PageProfile.TEXT_HEAVY
 
-    edge_density = _edge_density(image_bgr)
-    mean_sat = _mean_saturation(image_bgr)
+    edge_density = page_edge_density(image_bgr)
+    mean_sat = page_mean_saturation(image_bgr)
 
-    # Scanned engineering PDFs often embed the full-page raster — still crop via line art.
-    if embedded_on_page > 0 and is_pdf:
-        if mean_sat < 15 and edge_density >= 0.006:
-            return PageProfile.ENGINEERING_SHEET
-        return PageProfile.DIGITAL_PDF
+    # Full-page embedded raster — route to line-art cropping (pairs with SCANNED_PDF crop profile).
+    if is_full_page_embedded_pdf(embedded_on_page=embedded_on_page, is_pdf=is_pdf):
+        return PageProfile.ENGINEERING_SHEET
 
     page_aspect = pw / max(ph, 1)
     ocr_box_count = len(ocr.boxes)

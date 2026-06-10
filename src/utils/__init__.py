@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from src.utils.image_metrics import page_edge_density, page_mean_saturation
+
 
 def normalize_confidence(score: float) -> float:
     """Clamp and normalize a raw engine score to [0, 1]."""

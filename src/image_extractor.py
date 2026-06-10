@@ -37,6 +37,7 @@ from src.figure_fusion import (
 from src.profile_config import (
     CropProfile,
     ProfileConfig,
+    effective_max_figure_output_area,
     get_profile_config,
     log_page_profile_assignment,
     resolve_crop_profile,
@@ -45,6 +46,7 @@ from src.profile_config import (
 from src.logger import get_logger
 from src.ocr.ocr_engine import OcrPageResult, TextBox
 from src.utils import bbox_iou, save_bgr
+from src.utils.image_metrics import page_edge_density, page_mean_saturation
 
 log = get_logger(__name__)
 
@@ -134,6 +136,9 @@ def embedded_image_counts_by_page(
 
     When ``full_page_only`` is True (default), only full-page scan embeds are
     counted — small logos or partial figures do not trigger scanned-PDF routing.
+
+    Pass the per-page count as ``embedded_on_page`` to :func:`classify_page` and
+    :func:`resolve_crop_profile` (see :func:`is_full_page_embedded_pdf`).
     """
     threshold = min_bytes if min_bytes is not None else config.MIN_EMBEDDED_IMAGE_BYTES
     counts: dict[int, int] = {}
@@ -268,14 +273,9 @@ def _is_valid_photo_bbox(
 
 
 def _is_engineering_line_drawing(image_bgr: np.ndarray) -> bool:
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    mean_sat = float(hsv[:, :, 1].mean())
-    if mean_sat > config.PHOTO_SATURATION_MAX + 15:
+    if page_mean_saturation(image_bgr) > config.PHOTO_SATURATION_MAX + 15:
         return False
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    edge_density = float(np.count_nonzero(edges) / max(edges.size, 1))
-    return edge_density >= config.ENGINEERING_EDGE_DENSITY_MIN
+    return page_edge_density(image_bgr) >= config.ENGINEERING_EDGE_DENSITY_MIN
 
 
 def _find_layout_figures(
@@ -497,7 +497,7 @@ def _collect_photo_candidate(
     *,
     profile_config: ProfileConfig,
 ) -> FigureCandidate | None:
-    if profile == PageProfile.ENGINEERING_SHEET and _is_engineering_line_drawing(image_bgr):
+    if _is_engineering_line_drawing(image_bgr):
         return None
 
     found = _find_manufacturing_photo_bbox(image_bgr)
@@ -595,7 +595,8 @@ def _collect_morphology_candidate(
     x1, y1, x2, y2 = morph.bbox
     page_area = image_bgr.shape[0] * image_bgr.shape[1]
     morph_area = (x2 - x1) * (y2 - y1) / max(page_area, 1)
-    if morph_area > profile_config.max_figure_output_area_ratio * 0.88:
+    max_area = effective_max_figure_output_area(profile_config)
+    if morph_area > max_area * 0.88:
         log.debug(
             "Morphology area %.1f%% too large on page %d — deferring to other extractors",
             100 * morph_area,

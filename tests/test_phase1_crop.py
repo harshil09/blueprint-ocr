@@ -18,8 +18,10 @@ from src.profile_config import (
     detect_scanned_raster_page,
     effective_max_figure_output_area,
     get_profile_config,
+    is_full_page_embedded_pdf,
     scale_profile_config,
 )
+from src.utils.image_metrics import page_edge_density, page_mean_saturation
 from src import config
 from src.ocr.ocr_engine import OcrPageResult, TextBox
 
@@ -113,6 +115,19 @@ def test_prepare_primary_crop_cad_wide_respects_area_cap():
     _crop, bbox = result
     area_ratio = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / (img.shape[0] * img.shape[1])
     assert area_ratio <= cap + 0.02
+
+
+def test_page_image_metrics_shared():
+    img = _blank_page()
+    cv2.line(img, (100, 300), (700, 300), (0, 0, 0), 2)
+    assert page_edge_density(img) > 0.0
+    assert page_mean_saturation(img) >= 0.0
+
+
+def test_is_full_page_embedded_pdf_semantics():
+    assert is_full_page_embedded_pdf(embedded_on_page=1, is_pdf=True)
+    assert not is_full_page_embedded_pdf(embedded_on_page=1, is_pdf=False)
+    assert not is_full_page_embedded_pdf(embedded_on_page=0, is_pdf=True)
 
 
 def test_prepare_primary_crop_recovers_from_oversize_seed():
